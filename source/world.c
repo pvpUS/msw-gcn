@@ -6,16 +6,25 @@
 
 #include "world.h"
 #include "lz.h"
-#include "atlas_tpl.h"     /* generated: atlas_tpl[], atlas_tpl_size */
+#include "block_shapes.h"
+#include "atlas_tpl.h"        /* generated: atlas_tpl[], atlas_tpl_size */
+#include "block_faces_gen.h"  /* generated: g_topTile[], g_bottomTile[] */
+#include "atlas_gen.h"        /* generated: ATLAS_TEX_W/H, ATLAS_CELL, ... */
+#include "block_shapes_gen.h" /* generated: g_blockShape[], g_blockParam[] */
 
-/* ---- atlas layout (must match tools/build_atlas.py) -------------------- */
-#define ATLAS_COLS  32
-#define ATLAS_TILE  16
 /* Texcoords are GX_U16 with 10 fractional bits, so a stored value V maps to
- * V/1024. A normalised coordinate pixel/512 is therefore V = 2*pixel. Tiles
- * are inset half a pixel (+/-1) to stop atlas neighbours bleeding. */
-#define UV_LO(px)  (u16)(2 * (px) + 1)
-#define UV_HI(px)  (u16)(2 * (px) + 2 * ATLAS_TILE - 1)
+ * V/1024 of the texture's width/height. Each tile sits inside an ATLAS_PAD
+ * px clamped border (see tools/build_atlas.py's pad_tile()); UV_LO/UV_HI
+ * land exactly on the first/last *texel*'s center (px+0.5 .. px+TILE-0.5),
+ * inset from the padded cell, so mip-mapped/bilinear sampling never reaches
+ * past a tile's own padding into a real neighbour tile. This runs once per
+ * face while building the display list, not per frame, so plain floats are
+ * fine here. */
+static inline u16 uv_raw(float atlasPixel, float atlasDim) {
+	return (u16)(atlasPixel * 1024.0f / atlasDim + 0.5f);
+}
+#define UV_LO(px, dim) uv_raw((px) + 0.5f, (dim))
+#define UV_HI(px, dim) uv_raw((px) + ATLAS_TILE - 0.5f, (dim))
 
 #define BATCH_QUADS 16000  /* keep GX_Begin vertex counts under 65535 */
 
@@ -79,6 +88,13 @@ static inline int occ_solid(Occ *o, int x, int y, int z) {
 	u32 i = occ_index(o, x, y, z);
 	return (o->occ[i >> 3] >> (i & 7)) & 1;
 }
+/* Inverse of occ_index(): recovers grid coords from a linear index. */
+static inline void occ_decode(Occ *o, u32 idx, int *x, int *y, int *z) {
+	*y = (int)(idx % (u32)o->dimy);
+	u32 rest = idx / (u32)o->dimy;
+	*z = (int)(rest % (u32)o->dimz);
+	*x = (int)(rest / (u32)o->dimz);
+}
 
 /* ---- voxel stream walk ------------------------------------------------ */
 typedef void (*VoxFn)(void *ctx, int x, int y, int z, int li);
@@ -114,51 +130,182 @@ static void cb_occ(void *ctx, int x, int y, int z, int li) {
 	occ_set((Occ *)ctx, x, y, z);
 }
 
+/* ---- sparse non-cube shape table --------------------------------------
+ * Collision (World_BlockBoxes) and, from milestone 2 on, custom mesh
+ * emission both need "what shape/param does the block at (x,y,z) have"
+ * outside the palette-driven WalkVoxels passes. Only the (typically small)
+ * subset of occupied voxels whose shape isn't SHAPE_CUBE is recorded here,
+ * keyed by the same linear index scheme as occ[] (occ_index above).
+ * WalkVoxels visits voxels in strictly ascending occ_index order (columns
+ * in ascending (x*dimz+z), y ascending within a column), so entries are
+ * appended already sorted -- no separate sort pass needed. */
+typedef struct {
+	u32 *idx;
+	u8  *shape;
+	u8  *param;
+	u8  *connect;  /* neighbor connect mask, FENCE/WALL/PANE only; 0 else */
+	u32  count;
+	u32  cap;
+} ShapeGrid;
+
+static void shapegrid_push(ShapeGrid *sg, u32 idx, u8 shape, u8 param) {
+	if (sg->count == sg->cap) {
+		sg->cap    = sg->cap ? sg->cap * 2 : 64;
+		sg->idx    = realloc(sg->idx,    sg->cap * sizeof(u32));
+		sg->shape  = realloc(sg->shape,  sg->cap * sizeof(u8));
+		sg->param  = realloc(sg->param,  sg->cap * sizeof(u8));
+		sg->connect= realloc(sg->connect,sg->cap * sizeof(u8));
+	}
+	sg->idx[sg->count]    = idx;
+	sg->shape[sg->count]  = shape;
+	sg->param[sg->count]  = param;
+	sg->connect[sg->count]= 0;
+	sg->count++;
+}
+
+/* Binary search for a linear voxel index; returns its ShapeGrid slot or -1
+ * if that voxel is absent (i.e. a plain full cube, or unoccupied). */
+static int shapegrid_find(const ShapeGrid *sg, u32 idx) {
+	int lo = 0, hi = (int)sg->count - 1;
+	while (lo <= hi) {
+		int mid = (lo + hi) / 2;
+		if (sg->idx[mid] == idx) return mid;
+		if (sg->idx[mid] < idx) lo = mid + 1; else hi = mid - 1;
+	}
+	return -1;
+}
+
+typedef struct {
+	Occ *o;
+	const u8 *palette;
+	ShapeGrid *sg;
+} ShapeCtx;
+
+static void cb_shape(void *ctx, int x, int y, int z, int li) {
+	ShapeCtx *sc = (ShapeCtx *)ctx;
+	int g = rd_u16(sc->palette + li * 2);
+	u8 shape = g_blockShape[g];
+	if (shape == SHAPE_CUBE) return;
+	shapegrid_push(sc->sg, occ_index(sc->o, x, y, z), shape, g_blockParam[g]);
+}
+
+/* Fills sg->connect[] for FENCE/WALL/PANE entries: bit0=-X,1=+X,2=-Z,3=+Z,
+ * set when that neighbor is occupied and is either a plain full cube or
+ * another entry of the *same* shape (matches vanilla's "connects to solid
+ * blocks and same-family posts" rule; deliberately not species-specific,
+ * e.g. all fence species connect to each other, mirroring BlockFence). Must
+ * run after the ShapeGrid is fully built (needs random-access neighbor
+ * lookups WalkVoxels' single forward pass can't provide). */
+static void shapegrid_link(ShapeGrid *sg, Occ *o) {
+	static const int dx[4] = {-1, 1, 0, 0};
+	static const int dz[4] = {0, 0, -1, 1};
+	u32 i;
+	for (i = 0; i < sg->count; i++) {
+		u8 shape = sg->shape[i];
+		if (shape != SHAPE_FENCE && shape != SHAPE_WALL && shape != SHAPE_PANE)
+			continue;
+		int x, y, z;
+		occ_decode(o, sg->idx[i], &x, &y, &z);
+		u8 mask = 0;
+		int d;
+		for (d = 0; d < 4; d++) {
+			int nx = x + dx[d], nz = z + dz[d];
+			if (!occ_solid(o, nx, y, nz)) continue;
+			int ni = shapegrid_find(sg, occ_index(o, nx, y, nz));
+			if (ni < 0 || sg->shape[ni] == shape) mask |= (u8)(1 << d);
+		}
+		sg->connect[i] = mask;
+	}
+}
+
 typedef struct {
 	Occ *o;
 	const u8 *palette;   /* points into blob: big-endian u16 per local id */
+	ShapeGrid *sg;        /* for FENCE/WALL/PANE connect-mask lookup       */
 	u32 faceCount;       /* total (known before emit)                     */
 	u32 faceIdx;         /* running index while emitting                  */
 	int emit;            /* 0 = count, 1 = emit                           */
 } FaceCtx;
 
+/* Shared quad emitter for both the full-cube path and BlockShape_Mesh's
+ * custom shapes: `x0,y0,z0`..`x1,y1,z1` are a bounding box in sixteenths of a
+ * block, local to voxel (vx,vy,vz); `face` picks which 4 of its 8 corners
+ * make up that face (same faceVerts/faceUV/faceShade convention as before).
+ * Handles the count-vs-emit split and BATCH_QUADS GX_Begin/End bookkeeping,
+ * so callers (cb_face's cube loop, shape_quad_sink) don't need to. */
+static void emit_quad(FaceCtx *fc, int vx, int vy, int vz, int face,
+                      s16 x0, s16 y0, s16 z0, s16 x1, s16 y1, s16 z1, int tile) {
+	if (!fc->emit) { fc->faceCount++; return; }
+
+	if (fc->faceIdx % BATCH_QUADS == 0) {
+		u32 rem = fc->faceCount - fc->faceIdx;
+		u32 n = rem < BATCH_QUADS ? rem : BATCH_QUADS;
+		GX_Begin(GX_QUADS, GX_VTXFMT0, n * 4);
+	}
+
+	int col = tile % ATLAS_COLS;
+	int row = tile / ATLAS_COLS;
+	int px0 = col * ATLAS_CELL + ATLAS_PAD;
+	int py0 = row * ATLAS_CELL + ATLAS_PAD;
+	u16 u0 = UV_LO(px0, ATLAS_TEX_W), u1 = UV_HI(px0, ATLAS_TEX_W);
+	u16 v0 = UV_LO(py0, ATLAS_TEX_H), v1 = UV_HI(py0, ATLAS_TEX_H);
+	u8 sh = faceShade[face];
+	s16 bx[2] = {x0, x1}, by[2] = {y0, y1}, bz[2] = {z0, z1};
+
+	int v;
+	for (v = 0; v < 4; v++) {
+		GX_Position3s16((s16)(vx * 16 + bx[faceVerts[face][v][0]]),
+		                (s16)(vy * 16 + by[faceVerts[face][v][1]]),
+		                (s16)(vz * 16 + bz[faceVerts[face][v][2]]));
+		GX_Color4u8(sh, sh, sh, 255);
+		GX_TexCoord2u16(faceUV[face][v][0] ? u1 : u0,
+		                faceUV[face][v][1] ? v1 : v0);
+	}
+
+	fc->faceIdx++;
+	if (fc->faceIdx % BATCH_QUADS == 0) GX_End();
+}
+
+typedef struct { FaceCtx *fc; int x, y, z; } ShapeSink;
+
+static void shape_quad_sink(void *ctx, int face, s16 x0, s16 y0, s16 z0,
+                            s16 x1, s16 y1, s16 z1, int tile) {
+	ShapeSink *sk = (ShapeSink *)ctx;
+	emit_quad(sk->fc, sk->x, sk->y, sk->z, face, x0, y0, z0, x1, y1, z1, tile);
+}
+
 static void cb_face(void *ctx, int x, int y, int z, int li) {
 	FaceCtx *fc = (FaceCtx *)ctx;
+	int g = rd_u16(fc->palette + li * 2);
+	u8 shape = g_blockShape[g];
+
+	if (shape != SHAPE_CUBE) {
+		u8 param = g_blockParam[g];
+		u8 connect = 0;
+		if (shape == SHAPE_FENCE || shape == SHAPE_WALL || shape == SHAPE_PANE) {
+			int si = shapegrid_find(fc->sg, occ_index(fc->o, x, y, z));
+			connect = (si >= 0) ? fc->sg->connect[si] : 0;
+		}
+		ShapeSink sk = { fc, x, y, z };
+		/* No neighbor face-culling for custom shapes -- unlike full cubes,
+		 * their faces don't line up with the voxel boundary, so "is the
+		 * neighbor solid" doesn't reliably mean "is this face hidden"
+		 * (e.g. a bottom slab's top face is exposed regardless of what's in
+		 * the voxel above it). Always emitting the shape's own faces trades
+		 * a little overdraw on a minority of blocks for never leaving a
+		 * gap; GX_CULL_NONE means there's no correctness downside. */
+		BlockShape_Mesh(shape, param, connect, g, shape_quad_sink, &sk);
+		return;
+	}
+
 	int f;
 	for (f = 0; f < 6; f++) {
 		if (occ_solid(fc->o, x + faceNormal[f][0], y + faceNormal[f][1],
 		              z + faceNormal[f][2]))
 			continue;
-
-		if (!fc->emit) { fc->faceCount++; continue; }
-
-		if (fc->faceIdx % BATCH_QUADS == 0) {
-			u32 rem = fc->faceCount - fc->faceIdx;
-			u32 n = rem < BATCH_QUADS ? rem : BATCH_QUADS;
-			GX_Begin(GX_QUADS, GX_VTXFMT0, n * 4);
-		}
-
-		int g = rd_u16(fc->palette + li * 2);
-		int col = g & (ATLAS_COLS - 1);
-		int row = g / ATLAS_COLS;
-		int px0 = col * ATLAS_TILE;
-		int py0 = row * ATLAS_TILE;
-		u16 u0 = UV_LO(px0), u1 = UV_HI(px0);
-		u16 v0 = UV_LO(py0), v1 = UV_HI(py0);
-		u8 sh = faceShade[f];
-
-		int v;
-		for (v = 0; v < 4; v++) {
-			GX_Position3s16((s16)(x + faceVerts[f][v][0]),
-			                (s16)(y + faceVerts[f][v][1]),
-			                (s16)(z + faceVerts[f][v][2]));
-			GX_Color4u8(sh, sh, sh, 255);
-			GX_TexCoord2u16(faceUV[f][v][0] ? u1 : u0,
-			                faceUV[f][v][1] ? v1 : v0);
-		}
-
-		fc->faceIdx++;
-		if (fc->faceIdx % BATCH_QUADS == 0) GX_End();
+		/* Face order: 2:-Y(bottom) 3:+Y(top), others use the side tile. */
+		int tile = (f == 3) ? g_topTile[g] : (f == 2) ? g_bottomTile[g] : g;
+		emit_quad(fc, x, y, z, f, 0, 0, 0, 16, 16, 16, tile);
 	}
 }
 
@@ -169,7 +316,13 @@ void World_InitGX(void) {
 	GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
 	GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
 
-	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_S16, 0);
+	/* 4 fractional bits: positions are s16 in sixteenths of a block, matching
+	 * Minecraft's own 16-unit block-model grid so vanilla model coordinates
+	 * (slab half-heights, stair corners, fence-post insets, ...) map to
+	 * integers directly. Full-cube corners are always whole blocks (0 or 16
+	 * sixteenths), so scaling cb_face's positions by 16 (below) is a no-op
+	 * for existing worlds -- same geometry, just finer-grained encoding. */
+	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_S16, 4);
 	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
 	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_U16, 10);
 
@@ -187,7 +340,16 @@ void World_InitGX(void) {
 
 	TPL_OpenTPLFromMemory(&atlasTPL, (void *)atlas_tpl, atlas_tpl_size);
 	TPL_GetTexture(&atlasTPL, 0, &atlasTex);
-	GX_InitTexObjFilterMode(&atlasTex, GX_NEAR, GX_NEAR);
+	/* GX_NEAR_MIP_LIN when minified (viewed at any distance): point-sampled
+	 * within a level (keeps texels crisp/blocky) but blended between the
+	 * ATLAS_MAXLOD mip levels baked into the TPL, which are pre-averaged so
+	 * a noisy 16x16 texture doesn't alias into a moire pattern at distance.
+	 * Safe against atlas-neighbour bleeding because every tile is packed
+	 * with an ATLAS_PAD clamped border (tools/build_atlas.py's pad_tile())
+	 * wide enough to absorb the box filter's reach at ATLAS_MAXLOD.
+	 * GX_NEAR when magnified keeps the crisp blocky look up close. */
+	GX_InitTexObjLOD(&atlasTex, GX_NEAR_MIP_LIN, GX_NEAR,
+	                  0.0f, (float)ATLAS_MAXLOD, 0.0f, GX_ENABLE, GX_ENABLE, GX_ANISO_1);
 	GX_InitTexObjWrapMode(&atlasTex, GX_CLAMP, GX_CLAMP);
 }
 
@@ -234,9 +396,22 @@ int World_Load(World *w, const u8 *blob, u32 blobLen) {
 	 * World_Free. Its layout matches occ_index() / World_BlockSolid(). */
 	w->occ = o.occ;
 
+	/* 2.5. build the sparse non-cube shape table (collision + custom mesh
+	 * dispatch, see the ShapeGrid comment above). Must run before meshing
+	 * (step 3/4) so FENCE/WALL/PANE connectivity is known at emission time,
+	 * and is retained into w-> regardless of whether the mesh ends up empty. */
+	ShapeGrid sg; memset(&sg, 0, sizeof(sg));
+	ShapeCtx sc; sc.o = &o; sc.palette = palette; sc.sg = &sg;
+	WalkVoxels(S, w->dimz, ncol, idbytes, cb_shape, &sc);
+	shapegrid_link(&sg, &o);
+	w->shapeIdx = sg.idx; w->shapeShape = sg.shape;
+	w->shapeParam = sg.param; w->shapeConnect = sg.connect;
+	w->shapeCount = sg.count;
+
 	/* 3. count exposed faces */
 	FaceCtx fc;
-	fc.o = &o; fc.palette = palette; fc.faceCount = 0; fc.faceIdx = 0; fc.emit = 0;
+	fc.o = &o; fc.palette = palette; fc.sg = &sg;
+	fc.faceCount = 0; fc.faceIdx = 0; fc.emit = 0;
 	WalkVoxels(S, w->dimz, ncol, idbytes, cb_face, &fc);
 	w->faces = fc.faceCount;
 
@@ -276,6 +451,30 @@ int World_BlockSolid(const World *w, int bx, int by, int bz) {
 	return (w->occ[i >> 3] >> (i & 7)) & 1;
 }
 
+int World_BlockBoxes(const World *w, int bx, int by, int bz, BlockAABB out[2]) {
+	if (!w->occ) return 0;
+	int gx = bx - w->minx, gy = by - w->miny, gz = bz - w->minz;
+	if (gx < 0 || gx >= w->dimx || gy < 0 || gy >= w->dimy ||
+	    gz < 0 || gz >= w->dimz)
+		return 0;
+	u32 i = ((u32)gx * w->dimz + gz) * w->dimy + gy;
+	if (!((w->occ[i >> 3] >> (i & 7)) & 1)) return 0;
+
+	/* Occupied but absent from the sparse shape table: a plain full cube,
+	 * the common case -- same box World_BlockSolid's caller used to assume. */
+	int lo = 0, hi = (int)w->shapeCount - 1;
+	while (lo <= hi) {
+		int mid = (lo + hi) / 2;
+		if (w->shapeIdx[mid] == i) {
+			return BlockShape_Boxes(w->shapeShape[mid], w->shapeParam[mid],
+			                         w->shapeConnect[mid], out);
+		}
+		if (w->shapeIdx[mid] < i) lo = mid + 1; else hi = mid - 1;
+	}
+	out[0] = (BlockAABB){0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
+	return 1;
+}
+
 void World_Draw(World *w, Mtx view) {
 	if (!w->dl || w->dlLen == 0) return;
 
@@ -307,4 +506,10 @@ void World_Free(World *w) {
 	w->dlLen = 0;
 	if (w->occ) free(w->occ);
 	w->occ = NULL;
+	if (w->shapeIdx) free(w->shapeIdx);
+	if (w->shapeShape) free(w->shapeShape);
+	if (w->shapeParam) free(w->shapeParam);
+	if (w->shapeConnect) free(w->shapeConnect);
+	w->shapeIdx = NULL; w->shapeShape = NULL; w->shapeParam = NULL; w->shapeConnect = NULL;
+	w->shapeCount = 0;
 }

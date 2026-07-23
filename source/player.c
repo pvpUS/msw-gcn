@@ -59,32 +59,39 @@ static AABB bb_addcoord(AABB b, double dx, double dy, double dz) {
 
 static inline int ifloor(double d) { return (int)floor(d); }
 
-/* AxisAlignedBB.calculate{X,Y,Z}Offset with the *block* cube as `this`
- * (bx..bx+1) and the moving player box as `other`. */
-static double calcXOffset(int bx, int by, int bz, AABB o, double off) {
-	if (o.maxY > by && o.minY < by + 1 && o.maxZ > bz && o.minZ < bz + 1) {
-		if (off > 0.0 && o.maxX <= bx)     { double d = bx - o.maxX;     if (d < off) off = d; }
-		else if (off < 0.0 && o.minX >= bx + 1) { double d = (bx + 1) - o.minX; if (d > off) off = d; }
+/* AxisAlignedBB.calculate{X,Y,Z}Offset with an arbitrary block-local
+ * collision box (x0..x1 etc., world-absolute) as `this` and the moving
+ * player box as `other`. Bounds used to be hardcoded to a full unit cube
+ * (bx..bx+1); now generalized so non-cube block shapes (slabs, stairs,
+ * fences, ...) can supply their own partial box via World_BlockBoxes --
+ * full cubes still pass {bx,bx+1} etc. so behavior is unchanged for them. */
+static double calcXOffset(double x0, double y0, double z0,
+                          double x1, double y1, double z1, AABB o, double off) {
+	if (o.maxY > y0 && o.minY < y1 && o.maxZ > z0 && o.minZ < z1) {
+		if (off > 0.0 && o.maxX <= x0)      { double d = x0 - o.maxX; if (d < off) off = d; }
+		else if (off < 0.0 && o.minX >= x1) { double d = x1 - o.minX; if (d > off) off = d; }
 	}
 	return off;
 }
-static double calcYOffset(int bx, int by, int bz, AABB o, double off) {
-	if (o.maxX > bx && o.minX < bx + 1 && o.maxZ > bz && o.minZ < bz + 1) {
-		if (off > 0.0 && o.maxY <= by)     { double d = by - o.maxY;     if (d < off) off = d; }
-		else if (off < 0.0 && o.minY >= by + 1) { double d = (by + 1) - o.minY; if (d > off) off = d; }
+static double calcYOffset(double x0, double y0, double z0,
+                          double x1, double y1, double z1, AABB o, double off) {
+	if (o.maxX > x0 && o.minX < x1 && o.maxZ > z0 && o.minZ < z1) {
+		if (off > 0.0 && o.maxY <= y0)      { double d = y0 - o.maxY; if (d < off) off = d; }
+		else if (off < 0.0 && o.minY >= y1) { double d = y1 - o.minY; if (d > off) off = d; }
 	}
 	return off;
 }
-static double calcZOffset(int bx, int by, int bz, AABB o, double off) {
-	if (o.maxX > bx && o.minX < bx + 1 && o.maxY > by && o.minY < by + 1) {
-		if (off > 0.0 && o.maxZ <= bz)     { double d = bz - o.maxZ;     if (d < off) off = d; }
-		else if (off < 0.0 && o.minZ >= bz + 1) { double d = (bz + 1) - o.minZ; if (d > off) off = d; }
+static double calcZOffset(double x0, double y0, double z0,
+                          double x1, double y1, double z1, AABB o, double off) {
+	if (o.maxX > x0 && o.minX < x1 && o.maxY > y0 && o.minY < y1) {
+		if (off > 0.0 && o.maxZ <= z0)      { double d = z0 - o.maxZ; if (d < off) off = d; }
+		else if (off < 0.0 && o.minZ >= z1) { double d = z1 - o.minZ; if (d > off) off = d; }
 	}
 	return off;
 }
 
-/* World.getCollidingBoundingBoxes(...).isEmpty(): 1 if no solid block cube
- * intersects `b`. Used by the sneak ledge guard. */
+/* World.getCollidingBoundingBoxes(...).isEmpty(): 1 if no block's collision
+ * box intersects `b`. Used by the sneak ledge guard. */
 static int no_collision(const World *w, AABB b) {
 	int x0 = ifloor(b.minX), x1 = ifloor(b.maxX);
 	int y0 = ifloor(b.minY), y1 = ifloor(b.maxY);
@@ -92,12 +99,20 @@ static int no_collision(const World *w, AABB b) {
 	int bx, by, bz;
 	for (bx = x0; bx <= x1; bx++)
 		for (bz = z0; bz <= z1; bz++)
-			for (by = y0; by <= y1; by++)
-				if (World_BlockSolid(w, bx, by, bz) &&
-				    bx + 1 > b.minX && bx < b.maxX &&
-				    by + 1 > b.minY && by < b.maxY &&
-				    bz + 1 > b.minZ && bz < b.maxZ)
-					return 0;
+			for (by = y0; by <= y1; by++) {
+				BlockAABB boxes[2];
+				int n = World_BlockBoxes(w, bx, by, bz, boxes);
+				int k;
+				for (k = 0; k < n; k++) {
+					double wx0 = bx + boxes[k].x0, wx1 = bx + boxes[k].x1;
+					double wy0 = by + boxes[k].y0, wy1 = by + boxes[k].y1;
+					double wz0 = bz + boxes[k].z0, wz1 = bz + boxes[k].z1;
+					if (wx1 > b.minX && wx0 < b.maxX &&
+					    wy1 > b.minY && wy0 < b.maxY &&
+					    wz1 > b.minZ && wz0 < b.maxZ)
+						return 0;
+				}
+			}
 	return 1;
 }
 
@@ -116,27 +131,45 @@ static double sweepX(const World *w, Range r, AABB o, double off) {
 	int bx, by, bz;
 	for (bx = r.x0; bx < r.x1; bx++)
 		for (bz = r.z0; bz < r.z1; bz++)
-			for (by = r.y0; by < r.y1; by++)
-				if (World_BlockSolid(w, bx, by, bz))
-					off = calcXOffset(bx, by, bz, o, off);
+			for (by = r.y0; by < r.y1; by++) {
+				BlockAABB boxes[2];
+				int n = World_BlockBoxes(w, bx, by, bz, boxes);
+				int k;
+				for (k = 0; k < n; k++)
+					off = calcXOffset(bx + boxes[k].x0, by + boxes[k].y0, bz + boxes[k].z0,
+					                   bx + boxes[k].x1, by + boxes[k].y1, bz + boxes[k].z1,
+					                   o, off);
+			}
 	return off;
 }
 static double sweepY(const World *w, Range r, AABB o, double off) {
 	int bx, by, bz;
 	for (bx = r.x0; bx < r.x1; bx++)
 		for (bz = r.z0; bz < r.z1; bz++)
-			for (by = r.y0; by < r.y1; by++)
-				if (World_BlockSolid(w, bx, by, bz))
-					off = calcYOffset(bx, by, bz, o, off);
+			for (by = r.y0; by < r.y1; by++) {
+				BlockAABB boxes[2];
+				int n = World_BlockBoxes(w, bx, by, bz, boxes);
+				int k;
+				for (k = 0; k < n; k++)
+					off = calcYOffset(bx + boxes[k].x0, by + boxes[k].y0, bz + boxes[k].z0,
+					                   bx + boxes[k].x1, by + boxes[k].y1, bz + boxes[k].z1,
+					                   o, off);
+			}
 	return off;
 }
 static double sweepZ(const World *w, Range r, AABB o, double off) {
 	int bx, by, bz;
 	for (bx = r.x0; bx < r.x1; bx++)
 		for (bz = r.z0; bz < r.z1; bz++)
-			for (by = r.y0; by < r.y1; by++)
-				if (World_BlockSolid(w, bx, by, bz))
-					off = calcZOffset(bx, by, bz, o, off);
+			for (by = r.y0; by < r.y1; by++) {
+				BlockAABB boxes[2];
+				int n = World_BlockBoxes(w, bx, by, bz, boxes);
+				int k;
+				for (k = 0; k < n; k++)
+					off = calcZOffset(bx + boxes[k].x0, by + boxes[k].y0, bz + boxes[k].z0,
+					                   bx + boxes[k].x1, by + boxes[k].y1, bz + boxes[k].z1,
+					                   o, off);
+			}
 	return off;
 }
 
