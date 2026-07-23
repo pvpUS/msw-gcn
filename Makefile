@@ -116,6 +116,25 @@ $(OUTPUT).elf: $(OFILES)
 
 $(OFILES_SOURCES) : $(HFILES)
 
+#---------------------------------------------------------------------------------
+# embed compressed worlds (.mworld) and the texture atlas (.tpl) as binary data.
+# Override the stock bin2o (which relies on mktemp, unavailable/unwritable in
+# this toolchain shell) with one that stages the .s file in the build dir.
+#---------------------------------------------------------------------------------
+define bin2o
+	bin2s -a 32 -H `(echo $(<F) | tr . _)`.h $< > $(<F).s
+	$(CC) -x assembler-with-cpp $(CPPFLAGS) $(ASFLAGS) -c $(<F).s -o $(<F).o
+	rm -f $(<F).s
+endef
+
+%.mworld.o %_mworld.h : %.mworld
+	@echo $(notdir $<)
+	@$(bin2o)
+
+%.tpl.o %_tpl.h : %.tpl
+	@echo $(notdir $<)
+	@$(bin2o)
+
 -include $(DEPENDS)
 
 #---------------------------------------------------------------------------------
