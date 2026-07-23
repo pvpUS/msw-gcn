@@ -11,8 +11,10 @@
 #include <string.h>
 #include <malloc.h>
 #include <gccore.h>
+#include <ogc/lwp_watchdog.h>
 
 #include "camera.h"
+#include "player.h"
 #include "world.h"
 #include "menu.h"
 #include "maps_gen.h"
@@ -22,21 +24,56 @@
 static void *xfb[2] = {NULL, NULL};
 static GXRModeObj *rmode;
 
+/* Physics runs at a fixed 20 Hz (one Minecraft tick = 50 ms) regardless of
+ * the 50/60 Hz video field rate; positions are interpolated for rendering. */
+#define TICK_US 50000.0
+#define MAX_ACCUM_US 250000.0   /* cap catch-up to 5 ticks after a hitch */
+
 static void RunWorld(World *w, u32 curr) {
 	Mtx v;
-	Camera cam;
-	guVector pos;
-	float yaw, pitch;
+	Player player;
+	Camera cam;    /* debug free-fly camera (toggled with Z) */
+	int freecam = 0;
 
-	World_SpawnCamera(w, &pos, &yaw, &pitch);
-	Camera_Init(&cam, pos.x, pos.y, pos.z, yaw, pitch);
+	Player_Spawn(&player, w);
+
+	u64 prevTB = gettime();
+	double accum = 0.0;
 
 	while (SYS_MainLoop()) {
 		PAD_ScanPads();
-		if (PAD_ButtonsDown(0) & PAD_BUTTON_START) break;
+		u32 down = PAD_ButtonsDown(0);
+		if (down & PAD_BUTTON_START) break;
 
-		Camera_Update(&cam, 0);
-		Camera_GetViewMatrix(&cam, v);
+		if (down & PAD_TRIGGER_Z) {
+			freecam = !freecam;
+			if (freecam) {
+				/* start the debug camera at the player's eye */
+				Camera_Init(&cam,
+				            (float)(player.x * WORLD_BLOCK_SIZE),
+				            (float)((player.y + 1.62) * WORLD_BLOCK_SIZE),
+				            (float)(player.z * WORLD_BLOCK_SIZE),
+				            player.yaw, player.pitch);
+			}
+		}
+
+		u64 nowTB = gettime();
+		double dtUs = (double)ticks_to_microsecs(nowTB - prevTB);
+		prevTB = nowTB;
+
+		if (freecam) {
+			Camera_Update(&cam, 0);
+			Camera_GetViewMatrix(&cam, v);
+		} else {
+			Player_Look(&player, 0);
+			accum += dtUs;
+			if (accum > MAX_ACCUM_US) accum = MAX_ACCUM_US;
+			while (accum >= TICK_US) {
+				Player_Tick(&player, w, 0);
+				accum -= TICK_US;
+			}
+			Player_GetViewMatrix(&player, (float)(accum / TICK_US), v);
+		}
 
 		GX_SetViewport(0, 0, rmode->fbWidth, rmode->efbHeight, 0, 1);
 		GX_InvVtxCache();

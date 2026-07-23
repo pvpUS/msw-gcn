@@ -230,13 +230,17 @@ int World_Load(World *w, const u8 *blob, u32 blobLen) {
 	if (!o.occ) { free(S); return 0; }
 	WalkVoxels(S, w->dimz, ncol, idbytes, cb_occ, &o);
 
+	/* Retain the occupancy grid for runtime collision queries; freed in
+	 * World_Free. Its layout matches occ_index() / World_BlockSolid(). */
+	w->occ = o.occ;
+
 	/* 3. count exposed faces */
 	FaceCtx fc;
 	fc.o = &o; fc.palette = palette; fc.faceCount = 0; fc.faceIdx = 0; fc.emit = 0;
 	WalkVoxels(S, w->dimz, ncol, idbytes, cb_face, &fc);
 	w->faces = fc.faceCount;
 
-	if (fc.faceCount == 0) { free(o.occ); free(S); return 1; }
+	if (fc.faceCount == 0) { free(S); return 1; }
 
 	/* 4. allocate and record the display list */
 	/* Upper bound: 4 verts * 14 bytes per face, plus a GX_Begin header
@@ -254,9 +258,22 @@ int World_Load(World *w, const u8 *blob, u32 blobLen) {
 	if (fc.faceIdx % BATCH_QUADS != 0) GX_End();
 	w->dlLen = GX_EndDispList();
 
-	free(o.occ);
 	free(S);
 	return 1;
+}
+
+int World_BlockSolid(const World *w, int bx, int by, int bz) {
+	if (!w->occ) return 0;
+	/* Block coord B maps to occupancy grid index B - min (see World_Draw:
+	 * a grid cell g renders at world-block coordinate g + min). */
+	int gx = bx - w->minx;
+	int gy = by - w->miny;
+	int gz = bz - w->minz;
+	if (gx < 0 || gx >= w->dimx || gy < 0 || gy >= w->dimy ||
+	    gz < 0 || gz >= w->dimz)
+		return 0;
+	u32 i = ((u32)gx * w->dimz + gz) * w->dimy + gy;
+	return (w->occ[i >> 3] >> (i & 7)) & 1;
 }
 
 void World_Draw(World *w, Mtx view) {
@@ -276,15 +293,18 @@ void World_Draw(World *w, Mtx view) {
 }
 
 void World_SpawnCamera(World *w, guVector *pos, float *yaw, float *pitch) {
-	pos->x = 0.0f;
-	pos->y = (w->miny + w->dimy) * WORLD_BLOCK_SIZE * 0.5f + 30.0f;
-	pos->z = w->dimz * WORLD_BLOCK_SIZE * 0.6f;
+	/* Spawn at the true spawn point (the scan origin, world 0,0,0). */
+	pos->x = w->spawnx * WORLD_BLOCK_SIZE;
+	pos->y = w->spawny * WORLD_BLOCK_SIZE;
+	pos->z = w->spawnz * WORLD_BLOCK_SIZE;
 	*yaw = 0.0f;
-	*pitch = -18.0f;
+	*pitch = 0.0f;
 }
 
 void World_Free(World *w) {
 	if (w->dl) free(w->dl);
 	w->dl = NULL;
 	w->dlLen = 0;
+	if (w->occ) free(w->occ);
+	w->occ = NULL;
 }

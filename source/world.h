@@ -16,6 +16,8 @@ typedef struct {
 
 	void *dl;                  /* GX display list (32-byte aligned)          */
 	u32   dlLen;               /* display list length in bytes               */
+
+	u8   *occ;                 /* retained occupancy bitset for collision     */
 } World;
 
 /* One-time GX pipeline setup for world rendering (vtx formats, atlas TEV). */
@@ -31,6 +33,11 @@ void World_Draw(World *w, Mtx view);
 
 /* Suggested starting camera position/target for a freshly loaded world. */
 void World_SpawnCamera(World *w, guVector *pos, float *yaw, float *pitch);
+
+/* Collision query in Minecraft block coordinates (1 block = 1 unit).
+ * Returns 1 if the block at (bx,by,bz) is a solid full cube, 0 for air/void
+ * (outside the loaded region reads as air). */
+int  World_BlockSolid(const World *w, int bx, int by, int bz);
 
 void World_Free(World *w);
 
