@@ -1,0 +1,10 @@
+build/
+*.elf
+*.dol
+*.map
+*.z64
+*.v64
+*.n64
+
+# reference clone of devkitPro/gamecube-examples, not part of this project
+.gc-examples/
