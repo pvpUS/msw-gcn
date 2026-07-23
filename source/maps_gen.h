@@ -23,6 +23,7 @@
 #include "mega_martian_mworld.h"
 #include "mega_shaohao_mworld.h"
 #include "mega_shire_mworld.h"
+#include "model_gallery_mworld.h"
 #include "northern_mworld.h"
 #include "oasis_mworld.h"
 #include "oasisv2_mworld.h"
@@ -56,6 +57,7 @@ static const MapEntry g_maps[] = {
 	{ "Mega Martian", mega_martian_mworld, mega_martian_mworld_end, 239347 },
 	{ "Mega Shaohao", mega_shaohao_mworld, mega_shaohao_mworld_end, 223564 },
 	{ "Mega Shire", mega_shire_mworld, mega_shire_mworld_end, 120950 },
+	{ "Model Gallery", model_gallery_mworld, model_gallery_mworld_end, 5266 },
 	{ "Northern", northern_mworld, northern_mworld_end, 53179 },
 	{ "Oasis", oasis_mworld, oasis_mworld_end, 81101 },
 	{ "Oasisv2", oasisv2_mworld, oasisv2_mworld_end, 107021 },

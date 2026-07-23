@@ -309,6 +309,39 @@ static void cb_face(void *ctx, int x, int y, int z, int li) {
 	}
 }
 
+/* ---- collision-box wireframe overlay (MODEL_TEST_MODE, see main.c) ---
+ * Reuses GX_VTXFMT0 (same POS+CLR0+TEX0 layout as the real mesh) so no
+ * separate vertex format/desc is needed -- World_Draw disables texturing via
+ * a TEV state flip instead, so the filler texcoord below is simply unused
+ * while that flat-color stage is active. */
+static inline s16 wire_coord(int block, float frac) {
+	return (s16)(block * 16 + (int)(frac * 16.0f + 0.5f));
+}
+
+static void emit_wire_box(int bx, int by, int bz, const BlockAABB *box) {
+	s16 X[2] = { wire_coord(bx, box->x0), wire_coord(bx, box->x1) };
+	s16 Y[2] = { wire_coord(by, box->y0), wire_coord(by, box->y1) };
+	s16 Z[2] = { wire_coord(bz, box->z0), wire_coord(bz, box->z1) };
+	/* 12 edges of a box, each as a pair of {x,y,z} corner selectors (0/1
+	 * indexing into X/Y/Z above). */
+	static const u8 edges[12][2][3] = {
+		{{0,0,0},{1,0,0}}, {{1,0,0},{1,0,1}}, {{1,0,1},{0,0,1}}, {{0,0,1},{0,0,0}},
+		{{0,1,0},{1,1,0}}, {{1,1,0},{1,1,1}}, {{1,1,1},{0,1,1}}, {{0,1,1},{0,1,0}},
+		{{0,0,0},{0,1,0}}, {{1,0,0},{1,1,0}}, {{1,0,1},{1,1,1}}, {{0,0,1},{0,1,1}},
+	};
+	int e, v;
+	GX_Begin(GX_LINES, GX_VTXFMT0, 24);
+	for (e = 0; e < 12; e++) {
+		for (v = 0; v < 2; v++) {
+			const u8 *c = edges[e][v];
+			GX_Position3s16(X[c[0]], Y[c[1]], Z[c[2]]);
+			GX_Color4u8(255, 0, 255, 255); /* bright magenta: never a real block color */
+			GX_TexCoord2u16(0, 0);
+		}
+	}
+	GX_End();
+}
+
 /* ---- public API ------------------------------------------------------- */
 void World_InitGX(void) {
 	GX_ClearVtxDesc();
@@ -433,6 +466,29 @@ int World_Load(World *w, const u8 *blob, u32 blobLen) {
 	if (fc.faceIdx % BATCH_QUADS != 0) GX_End();
 	w->dlLen = GX_EndDispList();
 
+	/* 5. collision-box wireframe overlay -- see emit_wire_box above. Built
+	 * from `sg` (still in scope) regardless of shape count; skipped entirely
+	 * when there are no non-cube blocks (the overwhelming majority of maps). */
+	if (sg.count > 0) {
+		u32 maxBoxes = sg.count * 2;
+		u32 dbgSize = maxBoxes * (24 * 14 + 4) + 256;
+		dbgSize = (dbgSize + 31) & ~31u;
+		w->debugDl = memalign(32, dbgSize);
+		if (w->debugDl) {
+			GX_BeginDispList(w->debugDl, dbgSize);
+			u32 i;
+			for (i = 0; i < sg.count; i++) {
+				int x, y, z;
+				occ_decode(&o, sg.idx[i], &x, &y, &z);
+				BlockAABB boxes[2];
+				int n = BlockShape_Boxes(sg.shape[i], sg.param[i], sg.connect[i], boxes);
+				int b;
+				for (b = 0; b < n; b++) emit_wire_box(x, y, z, &boxes[b]);
+			}
+			w->debugDlLen = GX_EndDispList();
+		}
+	}
+
 	free(S);
 	return 1;
 }
@@ -475,7 +531,7 @@ int World_BlockBoxes(const World *w, int bx, int by, int bz, BlockAABB out[2]) {
 	return 1;
 }
 
-void World_Draw(World *w, Mtx view) {
+void World_Draw(World *w, Mtx view, int showDebugBoxes) {
 	if (!w->dl || w->dlLen == 0) return;
 
 	Mtx model, mv;
@@ -489,6 +545,24 @@ void World_Draw(World *w, Mtx view) {
 
 	GX_LoadTexObj(&atlasTex, GX_TEXMAP0);
 	GX_CallDispList(w->dl, w->dlLen);
+
+	if (showDebugBoxes && w->debugDl && w->debugDlLen) {
+		/* Same model/view matrix (already loaded above) applies to the debug
+		 * list too -- it uses the same fixed-point convention as dl. Flip to
+		 * a flat vertex-color TEV stage (no texture sampling) for the
+		 * wireframe pass, then restore World_InitGX's textured setup so the
+		 * rest of this frame (and the next one) draws normally. */
+		GX_SetNumTexGens(0);
+		GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+		GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+
+		GX_CallDispList(w->debugDl, w->debugDlLen);
+
+		GX_SetNumTexGens(1);
+		GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
+		GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
+		GX_SetTevOp(GX_TEVSTAGE0, GX_MODULATE);
+	}
 }
 
 void World_SpawnCamera(World *w, guVector *pos, float *yaw, float *pitch) {
@@ -504,6 +578,9 @@ void World_Free(World *w) {
 	if (w->dl) free(w->dl);
 	w->dl = NULL;
 	w->dlLen = 0;
+	if (w->debugDl) free(w->debugDl);
+	w->debugDl = NULL;
+	w->debugDlLen = 0;
 	if (w->occ) free(w->occ);
 	w->occ = NULL;
 	if (w->shapeIdx) free(w->shapeIdx);

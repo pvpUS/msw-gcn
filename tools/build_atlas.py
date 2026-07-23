@@ -262,7 +262,7 @@ def texture_for(bid):
     if base in ("STEP", "DOUBLE_STEP"):
         slab = {0:"stone.png",1:"sandstone_normal.png",2:"planks_oak.png",
                 3:"cobblestone.png",4:"brick.png",5:"stonebrick.png",
-                6:"quartz_block_side.png",7:"nether_brick.png"}
+                6:"nether_brick.png",7:"quartz_block_side.png"}
         return load_tex(slab.get(data & 7, "stone.png")) or solid((150,150,150))
     if base in ("STONE_SLAB2",):
         return load_tex("red_sandstone_normal.png") or solid((180,90,60))

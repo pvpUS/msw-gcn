@@ -17,6 +17,14 @@ typedef struct {
 	void *dl;                  /* GX display list (32-byte aligned)          */
 	u32   dlLen;               /* display list length in bytes               */
 
+	/* Wireframe boxes for every non-cube voxel's BlockShape_Boxes() result,
+	 * in the same fixed-point convention as dl -- lets MODEL_TEST_MODE (see
+	 * main.c) visually confirm the (independently hand-written) collision
+	 * boxes actually line up with the rendered mesh. Empty/NULL whenever
+	 * shapeCount is 0. See World_Draw's showDebugBoxes param. */
+	void *debugDl;
+	u32   debugDlLen;
+
 	u8   *occ;                 /* retained occupancy bitset for collision     */
 
 	/* Sparse per-voxel shape/collision data for the (typically small) subset
@@ -40,8 +48,10 @@ void World_InitGX(void);
  * returning; only the display list is retained. */
 int  World_Load(World *w, const u8 *blob, u32 blobLen);
 
-/* Draw the world. `view` is the camera view matrix. */
-void World_Draw(World *w, Mtx view);
+/* Draw the world. `view` is the camera view matrix. `showDebugBoxes` toggles
+ * the collision-box wireframe overlay (see World.debugDl) on top of the
+ * normal textured mesh. */
+void World_Draw(World *w, Mtx view, int showDebugBoxes);
 
 /* Suggested starting camera position/target for a freshly loaded world. */
 void World_SpawnCamera(World *w, guVector *pos, float *yaw, float *pitch);
