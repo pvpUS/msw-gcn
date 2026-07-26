@@ -25,7 +25,8 @@ const mapdbMod = require('./mapdb');
 const gclink = require('./gclink');
 const chat = require('./chat');
 const { WorldTranslator, popcount16 } = require('./world');
-const { EntityTranslator, firstColourCode } = require('./entities');
+const { EntityTranslator, firstColourCode,
+        LANDED_TICKS: LANDED } = require('./entities');
 const { StateTranslator, windowSlotToEngine, mcYawToGc, gcYawToMc } = require('./state');
 
 let pass = 0, fail = 0;
@@ -618,6 +619,44 @@ section('entity translation');
         e.onConsoleAttached();
         e.flush(0, 0, 0);
         eq(of(S.ENTITY_ADD).length, 2, 'but re-introduced to a fresh console');
+    }
+
+    // -- an arrow that sticks in a block comes off the console; one still in
+    //    flight does not, however slowly it is travelling.
+    {
+        const { e, of } = make();
+        const at = (n) => (map.originX + n) * POS_SCALE;
+        e.onObjectSpawn({ entityId: 60, type: 60, x: at(0), y: at(0), z: at(0),
+                          yaw: 0, pitch: 0 });
+        e.onObjectSpawn({ entityId: 61, type: 60, x: at(0), y: at(0), z: at(0),
+                          yaw: 0, pitch: 0 });
+        e.flush(map.originX, map.originY, map.originZ);
+        eq(of(S.ENTITY_ADD).length, 2, 'both arrows introduced');
+
+        // 60 holds still; 61 keeps moving a hair under a block per tick.
+        for (let i = 1; i <= LANDED + 4; i++) {
+            e.onRelMove({ entityId: 61, dX: 24, dY: 0, dZ: 0 }, false);
+            e.flush(map.originX, map.originY, map.originZ);
+        }
+
+        const removed = of(S.ENTITY_REMOVE);
+        eq(removed.length, 1, 'exactly one removal sent');
+        eq(removed[0][1].readInt32BE(0), 60, 'and it is the arrow that stopped');
+        eq(e.stats.landed, 1, 'counted as landed');
+        eq(e.count, 2, 'but still tracked here, so entity_destroy still matches');
+
+        // A console attaching mid-game must not be handed the whole quiver
+        // already stuck in the map.
+        const adds = of(S.ENTITY_ADD).length;
+        e.onConsoleAttached();
+        e.flush(map.originX, map.originY, map.originZ);
+        eq(of(S.ENTITY_ADD).length, adds + 1, 'a fresh console gets the flying arrow only');
+
+        // The console already forgot it, so its destroy must not be forwarded.
+        const before = of(S.ENTITY_REMOVE).length;
+        e.onDestroy({ entityIds: [60] });
+        eq(of(S.ENTITY_REMOVE).length, before, 'no second removal for a landed arrow');
+        eq(e.count, 1, 'and it is gone from the table');
     }
 }
 

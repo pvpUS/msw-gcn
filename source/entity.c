@@ -541,6 +541,15 @@ static void draw_dragon(const Entity *e, Mtx view, float alpha) {
 	float bodyYaw = Pose_LerpAngle(e->pose.prevHeadYaw, e->pose.headYaw, alpha);
 	float t = ((float)e->age + alpha) * 0.05f;   /* the undulation clock */
 
+	/* The dragon faces the other way to everything else. RendererLivingEntity
+	 * turns a body by `180 - renderYawOffset` (RendererLivingEntity.java:417),
+	 * and that half turn is what the engine's yaw convention and the mirrored X
+	 * in entity_base together reproduce -- so the player comes out right. But
+	 * RenderDragon overrides rotateCorpse and turns by plain `-f`
+	 * (RenderDragon.java:37), with no 180. Put it back here rather than in
+	 * entity_base, which every other model depends on being as it is. */
+	bodyYaw += 180.0f;
+
 	Mtx base;
 	entity_base(base, view, ix, iy, iz, bodyYaw, DRAGON_UNIT, DRAGON_ROOT_Y);
 

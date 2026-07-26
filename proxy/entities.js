@@ -42,6 +42,17 @@ const MOB_TYPES = new Map([
     [63, ENT.DRAGON],
 ]);
 
+/**
+ * How long an arrow must hold still before it counts as stuck in a block.
+ *
+ * A 1.8 arrow that hits something sets inGround and simply stops. The server
+ * keeps the entity -- it can still be picked up, and it lingers for 1200 ticks
+ * -- but sends nothing further about it, so there is no landed packet to key
+ * on. The silence is the signal. Ten flushes is half a second; an arrow in
+ * flight moves every single tick, so nothing airborne can reach it.
+ */
+const LANDED_TICKS = 10;
+
 /** 1.8 metadata index 0, the shared entity flag byte. */
 const META_ON_FIRE = 0x01;
 const META_SNEAKING = 0x02;
@@ -66,6 +77,8 @@ class Entity {
         this.colour = 0xff;
         this.added = false;                   // has the console been told?
         this.moved = false;                   // changed since the last flush?
+        this.hidden = false;                  // dropped from the console, still tracked here
+        this.stillTicks = 0;                  // flushes since this last changed position
     }
 }
 
@@ -88,7 +101,7 @@ class EntityTranslator {
 
         this.pendingAnims = [];
         this.pendingEquip = [];
-        this.stats = { added: 0, dropped: 0, evicted: 0, moves: 0 };
+        this.stats = { added: 0, dropped: 0, evicted: 0, moves: 0, landed: 0 };
     }
 
     setMap(m) { this.map = m; this.clear(); }
@@ -195,7 +208,10 @@ class EntityTranslator {
     onDestroy(pkt) {
         const gone = [];
         for (const eid of pkt.entityIds) {
-            if (this.entities.delete(eid)) gone.push(eid);
+            const e = this.entities.get(eid);
+            // A landed arrow was already taken off the console; do not spend a
+            // second removal telling it about something it has forgotten.
+            if (this.entities.delete(eid) && !e.hidden) gone.push(eid);
             this.evicted.delete(eid);
             this.uuidOf.delete(eid);
         }
@@ -355,7 +371,9 @@ class EntityTranslator {
         this.enforceCap(selfX, selfY, selfZ);
 
         for (const e of this.entities.values()) {
-            if (!e.added) { this.sendAdd(e); e.added = true; e.moved = false; }
+            // `hidden` outranks `added`, so a console attaching mid-game is not
+            // handed every arrow already stuck in the map.
+            if (!e.added && !e.hidden) { this.sendAdd(e); e.added = true; e.moved = false; }
         }
 
         // Batch the moves. A frame's worth of ENTITY_MOVE for 128 entities is
@@ -363,7 +381,7 @@ class EntityTranslator {
         // of 128 -- the console drains this inside a 16 ms frame.
         const moving = [];
         for (const e of this.entities.values()) {
-            if (!e.moved) continue;
+            if (!e.moved || e.hidden) continue;
             e.moved = false;
             const dx = e.x - (e.sentX ?? Infinity);
             if (e.sentX !== undefined &&
@@ -400,6 +418,45 @@ class EntityTranslator {
             this.link.send(S.ENTITY_ANIM, new Writer(5).i32(eid).u8(anim).done());
         }
         this.pendingAnims.length = 0;
+
+        this.reapLanded();
+    }
+
+    /**
+     * Take arrows off the console once they have stuck in a block.
+     *
+     * Over a game these accumulate without bound -- a wall someone shot at ends
+     * up studded with them -- and each costs a slot in a 128-entity table and a
+     * model on screen for something that will never move again. They stay in
+     * this table, so the eventual entity_destroy still matches and the flush
+     * loop above never re-adds them.
+     *
+     * Only arrows. Snowballs, pearls and potions die on impact rather than
+     * landing, and a dropped item lying still is exactly the thing you want to
+     * see. A bobber does sit motionless, but it is one per rod and it is how
+     * you read where someone cast.
+     */
+    reapLanded() {
+        const gone = [];
+        for (const e of this.entities.values()) {
+            if (e.type !== ENT.ARROW) continue;
+
+            if (e.x === e.stillX && e.y === e.stillY && e.z === e.stillZ) {
+                if (++e.stillTicks >= LANDED_TICKS && !e.hidden) {
+                    e.hidden = true;
+                    this.stats.landed++;
+                    if (e.added) gone.push(e.eid);
+                }
+                continue;
+            }
+
+            e.stillX = e.x; e.stillY = e.y; e.stillZ = e.z;
+            e.stillTicks = 0;
+            // Nothing in 1.8 dislodges a stuck arrow, but a type that can move
+            // again should come back rather than stay invisible for good.
+            if (e.hidden) { e.hidden = false; this.sendAdd(e); e.added = true; }
+        }
+        if (gone.length) this.sendRemovals(gone);
     }
 
     sendAdd(e) {
@@ -440,7 +497,10 @@ class EntityTranslator {
         const sx = selfX * POS_SCALE, sy = selfY * POS_SCALE, sz = selfZ * POS_SCALE;
         const ranked = [...this.entities.values()].map((e) => {
             const dx = e.x - sx, dy = e.y - sy, dz = e.z - sz;
-            const tier = (e.type === ENT.PLAYER || e.type === ENT.DRAGON) ? 0 : 1;
+            // A landed arrow is not on the console at all, so it is the first
+            // thing to give up its slot however close it happens to be.
+            const tier = e.hidden ? 2
+                       : (e.type === ENT.PLAYER || e.type === ENT.DRAGON) ? 0 : 1;
             return { e, tier, d: dx * dx + dy * dy + dz * dz };
         }).sort((a, b) => (a.tier - b.tier) || (a.d - b.d));
 
@@ -448,7 +508,7 @@ class EntityTranslator {
         const gone = [];
         for (const { e } of drop) {
             this.entities.delete(e.eid);
-            if (e.added) gone.push(e.eid);
+            if (e.added && !e.hidden) gone.push(e.eid);
             this.evicted.add(e.eid);
             this.stats.evicted++;
         }
@@ -460,7 +520,8 @@ class EntityTranslator {
     report() {
         const s = this.stats;
         return `entities ${this.entities.size} live, ${s.added} added, ` +
-               `${s.dropped} filtered out, ${s.evicted} evicted, ${s.moves} moves sent`;
+               `${s.dropped} filtered out, ${s.landed} arrows landed, ` +
+               `${s.evicted} evicted, ${s.moves} moves sent`;
     }
 }
 
@@ -477,4 +538,5 @@ function firstColourCode(s) {
 
 function stripCodes(s) { return String(s).replace(/§./g, ''); }
 
-module.exports = { EntityTranslator, OBJECT_TYPES, MOB_TYPES, firstColourCode, stripCodes };
+module.exports = { EntityTranslator, OBJECT_TYPES, MOB_TYPES, LANDED_TICKS,
+                   firstColourCode, stripCodes };
