@@ -74,6 +74,10 @@ typedef struct {
 	 * a failed scratch malloc would silently skip the re-mesh -- leaving the
 	 * broken block still drawn while collision and drops said it was gone. */
 	u16 *meshPad;
+
+	/* ---- accounting (World_GetStats) ------------------------------------ */
+	u32   chunksDrawn;         /* display lists the last World_Draw submitted */
+	float remeshMs, remeshMsMax;
 } World;
 
 /* Local block-relative (0..1) axis-aligned box. */
@@ -158,6 +162,28 @@ void World_DrawBlockOutline(World *w, Mtx view, int bx, int by, int bz);
 /* Vanilla's destroy_stage_N crack overlay on the block being mined; `stage` is
  * 0..DESTROY_STAGE_COUNT-1. Blends over the block's own faces. */
 void World_DrawBreakOverlay(World *w, Mtx view, int bx, int by, int bz, int stage);
+
+/* ---- accounting (the perf overlay, T27) ---------------------------------
+ * Memory is the binding constraint on this target -- 24 MB MEM1, a ~15 MB
+ * heap, and the densest map already at ~13 MB -- so every budget in the BBA
+ * plan is stated against one of these numbers, and the overlay is how they
+ * are read rather than a boot-time printf. */
+typedef struct {
+	u32 chunks;              /* meshed chunks (cxCount * czCount)            */
+	u32 chunksDrawn;         /* display lists submitted by the last draw     */
+	u32 faces;               /* quads baked into those lists                 */
+	u32 dlBytes;             /* bytes those display lists hold               */
+	u32 dlUsed;              /* bytes actually recorded into them            */
+	u32 clrCount, texCount;  /* indexed vertex arrays, vs the 65535 ceiling  */
+	u32 edits;               /* runtime block edits in the overlay           */
+	float remeshMs, remeshMsMax;  /* last / worst re-mesh, cleared per read  */
+} WorldStats;
+
+void World_GetStats(const World *w, WorldStats *out);
+
+/* Reset the rolling maxima (remeshMsMax), so a spike can be attributed to
+ * what just happened rather than to the whole session. */
+void World_ResetStatsMax(World *w);
 
 void World_Free(World *w);
 

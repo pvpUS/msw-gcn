@@ -4,6 +4,7 @@
 #include <malloc.h>
 #include <gccore.h>
 #include <ogc/tpl.h>
+#include <ogc/lwp_watchdog.h>   /* gettime / ticks_to_microsecs (remesh timing) */
 
 #include "world.h"
 #include "lz.h"
@@ -732,9 +733,12 @@ int World_SetBlock(World *w, int bx, int by, int bz, int id) {
 
 	PadGrid p;
 	pad_bind(w, &p);
+	u64 t0 = gettime();
 	int i;
 	for (i = 0; i < n; i++) remesh_chunk(w, cs[i][0], cs[i][1], &p);
 	flush_vertex_arrays(w);
+	w->remeshMs = (float)ticks_to_microsecs(gettime() - t0) / 1000.0f;
+	if (w->remeshMs > w->remeshMsMax) w->remeshMsMax = w->remeshMs;
 	return 1;
 }
 
@@ -968,10 +972,36 @@ void World_Draw(World *w, Mtx view) {
 	GX_SetArray(GX_VA_CLR0, w->clrArr, 4);
 	GX_SetArray(GX_VA_TEX0, w->texArr, 4);
 
-	u32 nchunks = (u32)w->cxCount * w->czCount, i;
+	u32 nchunks = (u32)w->cxCount * w->czCount, i, drawn = 0;
 	for (i = 0; i < nchunks; i++)
-		if (w->chunkDl[i] && w->chunkDlLen[i])
+		if (w->chunkDl[i] && w->chunkDlLen[i]) {
 			GX_CallDispList(w->chunkDl[i], w->chunkDlLen[i]);
+			drawn++;
+		}
+	w->chunksDrawn = drawn;
+}
+
+void World_GetStats(const World *w, WorldStats *out) {
+	memset(out, 0, sizeof(*out));
+	out->chunks      = (u32)w->cxCount * w->czCount;
+	out->chunksDrawn = w->chunksDrawn;
+	out->faces       = w->faces;
+	out->clrCount    = w->clrCount;
+	out->texCount    = w->texCount;
+	out->edits       = w->editCount;
+	out->remeshMs    = w->remeshMs;
+	out->remeshMsMax = w->remeshMsMax;
+	if (w->chunkDlCap) {
+		u32 i;
+		for (i = 0; i < out->chunks; i++) {
+			out->dlBytes += w->chunkDlCap[i];
+			out->dlUsed  += w->chunkDlLen[i];
+		}
+	}
+}
+
+void World_ResetStatsMax(World *w) {
+	w->remeshMsMax = 0.0f;
 }
 
 void World_DrawBlockOutline(World *w, Mtx view, int bx, int by, int bz) {

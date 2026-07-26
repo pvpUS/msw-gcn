@@ -122,12 +122,26 @@ static void FillDemoItems(Player *player) {
 }
 #endif
 
+/* Perf overlay (T27) on by default: every memory and frame-time budget in the
+ * BBA plan is read off it, and on a 24 MB machine an unmeasured budget is an
+ * aspiration. */
+#define PERF_HUD 1
+
+static u32 CountEntities(const ItemWorld *iw) {
+	u32 n = 0;
+	int i;
+	for (i = 0; i < MAX_ENTITY_ITEMS; i++) if (iw->e[i].alive) n++;
+	return n;
+}
+
 static void RunWorld(World *w, u32 curr) {
 	Mtx v;
 	Player player;
 	Camera cam;    /* debug free-fly camera (toggled with Z) */
 	Interact interact;   /* block breaking/placing (PlayerControllerMP port) */
 	ItemWorld items;     /* loose EntityItem drops                           */
+	HudPerf perf;
+	int perfOn = PERF_HUD;
 	int freecam = 0;
 	int invOpen = 0;   /* full inventory screen (toggle: X)                */
 	int invCursor = 0; /* main-slot index the inventory cursor is over     */
@@ -141,6 +155,7 @@ static void RunWorld(World *w, u32 curr) {
 	Player_Spawn(&player, w);
 	Interact_Init(&interact);
 	ItemWorld_Init(&items);
+	Hud_PerfInit(&perf);
 #if HUD_DEMO_ITEMS
 	FillDemoItems(&player);
 #endif
@@ -197,6 +212,12 @@ static void RunWorld(World *w, u32 curr) {
 		if (!invOpen) {
 			if (down & PAD_BUTTON_LEFT)  Inventory_ChangeCurrentItem(&player.inventory,  1);
 			if (down & PAD_BUTTON_RIGHT) Inventory_ChangeCurrentItem(&player.inventory, -1);
+			/* Perf overlay toggle. T16's button map reclaims D-pad Down for
+			 * drop-item; move this then. */
+			if (down & PAD_BUTTON_DOWN) {
+				perfOn = !perfOn;
+				if (perfOn) { Hud_PerfInit(&perf); World_ResetStatsMax(w); }
+			}
 		} else {
 			if (down & PAD_BUTTON_LEFT)  invCursor = InvCursorMove(invCursor, -1,  0);
 			if (down & PAD_BUTTON_RIGHT) invCursor = InvCursorMove(invCursor,  1,  0);
@@ -228,6 +249,7 @@ static void RunWorld(World *w, u32 curr) {
 		double dtUs = (double)ticks_to_microsecs(nowTB - prevTB);
 		prevTB = nowTB;
 
+		double tickUs = 0.0;
 		if (freecam) {
 			Camera_Update(&cam, 0);
 			Camera_GetViewMatrix(&cam, v);
@@ -235,6 +257,7 @@ static void RunWorld(World *w, u32 curr) {
 			if (!invOpen) Player_Look(&player, 0);   /* freeze the view when browsing */
 			accum += dtUs;
 			if (accum > MAX_ACCUM_US) accum = MAX_ACCUM_US;
+			u64 tickTB = gettime();
 			while (accum >= TICK_US) {
 				/* Minecraft.runTick's order: the controller acts on the
 				 * targeted block first, then the player moves, then the
@@ -245,6 +268,7 @@ static void RunWorld(World *w, u32 curr) {
 				ItemWorld_Tick(&items, w, &player);
 				accum -= TICK_US;
 			}
+			tickUs = (double)ticks_to_microsecs(gettime() - tickTB);
 			alpha = (float)(accum / TICK_US);
 			Player_GetViewMatrix(&player, alpha, v);
 		}
@@ -280,6 +304,12 @@ static void RunWorld(World *w, u32 curr) {
 				HeldItem_Draw(&player, rmode->fbWidth, rmode->efbHeight);
 			Hud_Draw(&player, rmode->fbWidth, rmode->efbHeight, invOpen, invCursor);
 		}
+
+		/* Perf overlay last, on top of everything, in its own 2D pass. Sampled
+		 * every frame even when hidden so the maxima and the heap low-water
+		 * mark stay honest across a toggle. */
+		Hud_PerfSample(&perf, dtUs, tickUs, w, CountEntities(&items));
+		if (perfOn) Hud_DrawPerf(&perf, rmode->fbWidth, rmode->efbHeight);
 
 		GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
 		GX_SetColorUpdate(GX_TRUE);

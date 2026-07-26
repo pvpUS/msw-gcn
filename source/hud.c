@@ -1,14 +1,20 @@
 #include <math.h>
+#include <string.h>
 #include <gccore.h>
+#include <ogc/tpl.h>
 
 #include "hud.h"
 #include "world.h"
 #include "inventory.h"
 #include "atlas_gen.h"   /* ATLAS_COLS/CELL/PAD/TILE/TEX_W/TEX_H */
+#include "font_gen.h"    /* generated: FONT_*, g_fontWidth[]     */
+#include "font_tpl.h"    /* generated: font_tpl[], font_tpl_size  */
 
 /* Dedicated 2D vertex format so we never disturb the world's GX_VTXFMT0.
  * POS as 2D floats + RGBA8 vertex colour + float texcoords, matching the
- * canonical GameCube sprite setup (see .gc-examples gxSprites). */
+ * canonical GameCube sprite setup (see .gc-examples gxSprites). A glyph quad
+ * is exactly this layout too, so text needs no format of its own -- only a
+ * second GXTexObj. (Formats 0/1/2 are world/HUD/helditem.) */
 #define HUD_FMT GX_VTXFMT1
 
 /* ---- GX state helpers -------------------------------------------------- */
@@ -63,50 +69,156 @@ static void tile_icon(float x, float y, float s, int tile) {
 	GX_End();
 }
 
-/* ---- 3x5 digit font (stack counts) ------------------------------------ */
-/* Each row is 3 bits, MSB = leftmost column. */
-static const u8 DIGITS[10][5] = {
-	{7,5,5,5,7}, {2,6,2,2,7}, {7,1,7,4,7}, {7,1,7,1,7}, {5,5,7,1,1},
-	{7,4,7,1,7}, {7,4,7,5,7}, {7,1,2,2,2}, {7,5,7,5,7}, {7,5,7,1,7},
-};
+/* ---- text (FontRenderer) ----------------------------------------------- */
 
-static void draw_digit(float x, float y, float px, int d,
-                       u8 r, u8 g, u8 b, u8 a) {
-	int row, col;
-	for (row = 0; row < 5; row++)
-		for (col = 0; col < 3; col++)
-			if (DIGITS[d][row] & (1 << (2 - col)))
-				rect(x + col * px, y + row * px, px, px, r, g, b, a);
+static TPLFile  fontTPL;
+static GXTexObj fontTex;
+
+/* FontRenderer's 16 colour codes, built exactly as its constructor does:
+ * bit3 = "bright" (+85 to every channel), bits 2/1/0 = R/G/B at 170, with
+ * gold (6) getting an extra +85 red. Index = the hex digit after a section
+ * sign. Stored 0xRRGGBB; alpha comes from the caller's colour. */
+static u32 color_code(int i) {
+	int j  = ((i >> 3) & 1) * 85;
+	int r  = ((i >> 2) & 1) * 170 + j;
+	int g  = ((i >> 1) & 1) * 170 + j;
+	int b  = ((i >> 0) & 1) * 170 + j;
+	if (i == 6) r += 85;
+	return ((u32)(r & 255) << 16) | ((u32)(g & 255) << 8) | (u32)(b & 255);
 }
 
-static int num_digits(int v) {
-	int n = 1;
-	while (v >= 10) { v /= 10; n++; }
+/* A character's cell in ascii.png. For the printable range this engine draws,
+ * FontRenderer's ordering string puts a character at its own code (see
+ * tools/build_font.py); anything else is folded to '?' rather than sampling a
+ * cell we have no width for. Chat text arrives already folded to printable
+ * ASCII by the proxy, so this is a backstop, not the common path. */
+static inline int glyph_index(unsigned char c) {
+	if (c < FONT_FIRST_CHAR || c > FONT_LAST_CHAR) return '?' - FONT_FIRST_CHAR;
+	return c - FONT_FIRST_CHAR;
+}
+
+/* Section sign (0xA7), the colour-code escape. */
+#define FONT_ESC 0xA7
+
+static inline int is_hex_digit(unsigned char c) {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+	       (c >= 'A' && c <= 'F');
+}
+
+/* Consume a formatting code at `s` (which points at the character *after* the
+ * section sign). Returns 1 if it was one, updating *rgb when it set a colour.
+ * The style codes (k/l/m/n/o obfuscated..italic) and r (reset) are recognised
+ * and swallowed; only colour is actually applied. */
+static int format_code(unsigned char c, u32 base, u32 *rgb) {
+	if (is_hex_digit(c)) {
+		int v = (c <= '9') ? c - '0' : (c | 32) - 'a' + 10;
+		*rgb = color_code(v);
+		return 1;
+	}
+	if (c == 'r' || c == 'R') { *rgb = base >> 8; return 1; }
+	return (c | 32) >= 'k' && (c | 32) <= 'o';
+}
+
+int Hud_StringWidth(const char *s) {
+	int w = 0;
+	const unsigned char *p = (const unsigned char *)s;
+	for (; *p; p++) {
+		if (*p == FONT_ESC && p[1]) {
+			u32 dummy = 0;
+			if (format_code(p[1], 0, &dummy)) { p++; continue; }
+		}
+		w += g_fontWidth[glyph_index(*p)];
+	}
+	return w;
+}
+
+/* One 8x8 glyph quad at the pen position. The quad is always FONT_CELL square
+ * even though the advance is narrower, so glyphs that overhang their own
+ * width (the tail of a 'j', say) are not clipped -- vanilla does the same. */
+static void glyph_quad(float x, float y, int gi, u8 r, u8 g, u8 b, u8 a) {
+	int cell = gi + FONT_FIRST_CHAR;
+	float u0 = (float)(cell % FONT_GRID * FONT_CELL) / FONT_TEX_W;
+	float v0 = (float)(cell / FONT_GRID * FONT_CELL) / FONT_TEX_H;
+	/* 7.99 rather than 8, exactly as FontRenderer.renderDefaultChar: it keeps
+	 * the sample off the shared edge with the next cell. */
+	float u1 = u0 + 7.99f / FONT_TEX_W;
+	float v1 = v0 + 7.99f / FONT_TEX_H;
+	float s = (float)FONT_CELL;
+	GX_Position2f32(x,     y    ); GX_Color4u8(r, g, b, a); GX_TexCoord2f32(u0, v0);
+	GX_Position2f32(x + s, y    ); GX_Color4u8(r, g, b, a); GX_TexCoord2f32(u1, v0);
+	GX_Position2f32(x + s, y + s); GX_Color4u8(r, g, b, a); GX_TexCoord2f32(u1, v1);
+	GX_Position2f32(x,     y + s); GX_Color4u8(r, g, b, a); GX_TexCoord2f32(u0, v1);
+}
+
+/* Number of glyph quads `s` will emit, so the whole string goes into one
+ * GX_Begin instead of one per character. */
+static int glyph_count(const char *s) {
+	int n = 0;
+	const unsigned char *p = (const unsigned char *)s;
+	for (; *p; p++) {
+		if (*p == FONT_ESC && p[1]) {
+			u32 dummy = 0;
+			if (format_code(p[1], 0, &dummy)) { p++; continue; }
+		}
+		n++;
+	}
 	return n;
 }
 
-/* Draw `value` with its MOST significant digit's top-left at (x,y). Columns are
- * px wide; a 1-column gap separates digits (advance 4*px per digit). */
-static void draw_number(float x, float y, float px, int value,
-                        u8 r, u8 g, u8 b, u8 a) {
-	int n = num_digits(value);
-	int i;
-	for (i = n - 1; i >= 0; i--) {
-		int place = 1, k;
-		for (k = 0; k < i; k++) place *= 10;
-		draw_digit(x, y, px, (value / place) % 10, r, g, b, a);
-		x += 4 * px;
+int Hud_DrawString(const char *s, int x, int y, u32 rgba) {
+	int n = glyph_count(s);
+	if (n <= 0) return x;
+
+	tev_tex();
+	GX_LoadTexObj(&fontTex, GX_TEXMAP0);
+
+	u32 rgb = rgba >> 8;
+	u8  a   = (u8)(rgba & 0xFF);
+	float pen = (float)x;
+
+	GX_Begin(GX_QUADS, HUD_FMT, (u16)(4 * n));
+	const unsigned char *p = (const unsigned char *)s;
+	for (; *p; p++) {
+		if (*p == FONT_ESC && p[1] && format_code(p[1], rgba, &rgb)) { p++; continue; }
+		int gi = glyph_index(*p);
+		glyph_quad(pen, (float)y, gi,
+		           (u8)(rgb >> 16), (u8)(rgb >> 8), (u8)rgb, a);
+		pen += g_fontWidth[gi];
 	}
+	GX_End();
+	return (int)pen;
 }
 
-/* Stack count, right-aligned to (rx, ...) with the digits' bottom at by, with a
- * 1px drop shadow (like the vanilla item overlay). */
-static void draw_count(float rx, float by, float px, int value) {
-	float w = (4 * num_digits(value) - 1) * px;
-	float x = rx - w;
-	float y = by - 5 * px;
-	draw_number(x + px, y + px, px, value, 40, 40, 40, 255);   /* shadow */
-	draw_number(x,      y,      px, value, 255, 255, 255, 255); /* white  */
+int Hud_DrawStringShadow(const char *s, int x, int y, u32 rgba) {
+	/* FontRenderer.drawString's drop shadow: the same text one pixel down-right
+	 * at a quarter brightness, alpha unchanged. */
+	u32 dark = ((rgba >> 2) & 0x3F3F3F00u) | (rgba & 0xFFu);
+	Hud_DrawString(s, x + 1, y + 1, dark);
+	return Hud_DrawString(s, x, y, rgba);
+}
+
+/* ---- small integer formatting (no stdio in the render path) ------------- */
+
+/* Right-aligned decimal into `buf`; returns a pointer into it. Used for stack
+ * counts and the perf overlay, both of which run every frame. */
+static char *fmt_int(char *buf, int size, int v) {
+	char *p = buf + size - 1;
+	int neg = v < 0;
+	unsigned u = neg ? (unsigned)(-v) : (unsigned)v;
+	*p = '\0';
+	do { *--p = (char)('0' + u % 10); u /= 10; } while (u && p > buf + 1);
+	if (neg && p > buf) *--p = '-';
+	return p;
+}
+
+/* Stack count over an item icon: right-aligned to rx with its baseline where
+ * GuiIngame puts it (the icon's bottom edge less 7), with the font's own drop
+ * shadow. */
+static void draw_count(float rx, float by, int value) {
+	char buf[12];
+	char *s = fmt_int(buf, sizeof buf, value);
+	Hud_DrawStringShadow(s, (int)rx - Hud_StringWidth(s), (int)by - 7,
+	                     0xFFFFFFFFu);
 }
 
 /* ---- heart bitmap (7 wide x 6 tall), MSB = leftmost column ------------- */
@@ -155,22 +267,30 @@ void Hud_InitGX(void) {
 	GX_SetVtxAttrFmt(HUD_FMT, GX_VA_POS,  GX_POS_XY,   GX_F32,   0);
 	GX_SetVtxAttrFmt(HUD_FMT, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
 	GX_SetVtxAttrFmt(HUD_FMT, GX_VA_TEX0, GX_TEX_ST,   GX_F32,   0);
+
+	/* The glyph sheet is its own small I4 texture rather than atlas tiles --
+	 * 256 cells would have eaten most of the atlas's remaining space, and the
+	 * atlas's padded 16x16 cell grid can't express an 8x8 glyph layout anyway.
+	 * Point sampling and no mipmaps: text is drawn at an integer GUI scale and
+	 * any filtering just blurs it. */
+	TPL_OpenTPLFromMemory(&fontTPL, (void *)font_tpl, font_tpl_size);
+	TPL_GetTexture(&fontTPL, 0, &fontTex);
+	GX_InitTexObjFilterMode(&fontTex, GX_NEAR, GX_NEAR);
+	GX_InitTexObjWrapMode(&fontTex, GX_CLAMP, GX_CLAMP);
 }
 
-void Hud_Draw(Player *p, int fbWidth, int efbHeight, int invOpen, int cursorSlot) {
-	Inventory *inv = &p->inventory;
-
+HudScreen Hud_Begin2D(int fbWidth, int efbHeight) {
 	/* GUI scale a la ScaledResolution: work in a virtual space ~1/2..1/3 the
 	 * framebuffer so HUD elements stay a sensible size across video modes. */
-	int scale = efbHeight / 240;
-	if (scale < 1) scale = 1;
-	if (scale > 3) scale = 3;
-	float gw = (float)fbWidth  / scale;
-	float gh = (float)efbHeight / scale;
+	HudScreen sc;
+	sc.scale = efbHeight / 240;
+	if (sc.scale < 1) sc.scale = 1;
+	if (sc.scale > 3) sc.scale = 3;
+	sc.w = (float)fbWidth  / sc.scale;
+	sc.h = (float)efbHeight / sc.scale;
 
-	/* --- enter 2D --- */
 	Mtx44 proj;
-	guOrtho(proj, 0, gh, 0, gw, 0, 300);
+	guOrtho(proj, 0, sc.h, 0, sc.w, 0, 300);
 	GX_LoadProjectionMtx(proj, GX_ORTHOGRAPHIC);
 
 	Mtx mv;
@@ -187,6 +307,19 @@ void Hud_Draw(Player *p, int fbWidth, int efbHeight, int invOpen, int cursorSlot
 	GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);          /* always on top */
 	GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_CLEAR);
 	GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
+	return sc;
+}
+
+void Hud_End2D(void) {
+	World_SetupRenderState();
+	GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
+}
+
+void Hud_Draw(Player *p, int fbWidth, int efbHeight, int invOpen, int cursorSlot) {
+	Inventory *inv = &p->inventory;
+
+	HudScreen sc = Hud_Begin2D(fbWidth, efbHeight);
+	float gw = sc.w, gh = sc.h;
 
 	/* hotbar geometry (GuiIngame.renderTooltip) */
 	float hbLeft = gw / 2 - 91;
@@ -264,14 +397,13 @@ void Hud_Draw(Player *p, int fbWidth, int efbHeight, int invOpen, int cursorSlot
 		}
 	}
 
-	/* ===== pass C: flat stack counts ===== */
-	tev_flat();
+	/* ===== pass C: stack counts, in the real font ===== */
 	if (!invOpen) {
 		int j;
 		for (j = 0; j < INV_HOTBAR_SIZE; j++) {
 			ItemStack *s = &inv->main[j];
 			if (!ItemStack_IsEmpty(s) && s->count > 1)
-				draw_count(hbLeft + 3 + j * 20 + 16, hbTop + 3 + 16, 1.0f, s->count);
+				draw_count(hbLeft + 3 + j * 20 + 16, hbTop + 3 + 16, s->count);
 		}
 	} else {
 		float gl = (gw - 176) / 2, gt = (gh - 166) / 2;
@@ -280,15 +412,157 @@ void Hud_Draw(Player *p, int fbWidth, int efbHeight, int invOpen, int cursorSlot
 			ItemStack *s = &inv->main[i];
 			if (ItemStack_IsEmpty(s) || s->count <= 1) continue;
 			float cx, cy; inv_cell(i, gl, gt, &cx, &cy);
-			draw_count(cx + 1 + 16, cy + 1 + 16, 1.0f, s->count);
+			draw_count(cx + 1 + 16, cy + 1 + 16, s->count);
 		}
 		if (inv->carried.count > 1 && cursorSlot >= 0 && cursorSlot < INV_MAIN_SIZE) {
 			float cx, cy; inv_cell(cursorSlot, gl, gt, &cx, &cy);
-			draw_count(cx + 9 + 16, cy + 9 + 16, 1.0f, inv->carried.count);
+			draw_count(cx + 9 + 16, cy + 9 + 16, inv->carried.count);
 		}
 	}
 
-	/* --- leave 2D: restore the world's render pipeline --- */
-	World_SetupRenderState();
-	GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
+	Hud_End2D();
+}
+
+/* ---- perf overlay (T27) ------------------------------------------------- */
+
+/* Exponential mean over roughly the last second at 60 Hz. A plain mean over
+ * the whole session goes flat and stops reporting; the maxima below are what
+ * catch a one-frame spike. */
+#define PERF_SMOOTH 0.05f
+
+void Hud_PerfInit(HudPerf *pf) {
+	memset(pf, 0, sizeof(*pf));
+	pf->heapFree = (u32)((char *)SYS_GetArena1Hi() - (char *)SYS_GetArena1Lo());
+	pf->heapLow  = pf->heapFree;
+}
+
+void Hud_PerfSample(HudPerf *pf, double frameUs, double tickUs,
+                    const World *w, u32 entities) {
+	pf->frameMs = (float)(frameUs / 1000.0);
+	pf->tickMs  = (float)(tickUs / 1000.0);
+	pf->frameMsAvg += (pf->frameMs - pf->frameMsAvg) * PERF_SMOOTH;
+	if (pf->frameMs > pf->frameMsMax) pf->frameMsMax = pf->frameMs;
+	if (pf->tickMs  > pf->tickMsMax)  pf->tickMsMax  = pf->tickMs;
+
+	pf->heapFree = (u32)((char *)SYS_GetArena1Hi() - (char *)SYS_GetArena1Lo());
+	if (pf->heapFree < pf->heapLow) pf->heapLow = pf->heapFree;
+	pf->entities = entities;
+	if (w) World_GetStats(w, &pf->w);
+}
+
+/* Append `s` to buf at *pos, stopping at the end. The overlay builds its lines
+ * every frame, so this stays away from stdio. */
+static void app_str(char *buf, int cap, int *pos, const char *s) {
+	while (*s && *pos < cap - 1) buf[(*pos)++] = *s++;
+	buf[*pos] = '\0';
+}
+
+static void app_int(char *buf, int cap, int *pos, int v) {
+	char tmp[12];
+	app_str(buf, cap, pos, fmt_int(tmp, sizeof tmp, v));
+}
+
+/* One decimal place, which is the useful resolution for a 16.6 ms budget. */
+static void app_ms(char *buf, int cap, int *pos, float ms) {
+	if (ms < 0.0f) ms = 0.0f;
+	int t = (int)(ms * 10.0f + 0.5f);
+	app_int(buf, cap, pos, t / 10);
+	app_str(buf, cap, pos, ".");
+	app_int(buf, cap, pos, t % 10);
+}
+
+/* Bytes as KB, the unit every budget in the plan is quoted in. */
+static void app_kb(char *buf, int cap, int *pos, u32 bytes) {
+	app_int(buf, cap, pos, (int)(bytes / 1024));
+	app_str(buf, cap, pos, "K");
+}
+
+void Hud_DrawPerf(const HudPerf *pf, int fbWidth, int efbHeight) {
+	HudScreen sc = Hud_Begin2D(fbWidth, efbHeight);
+
+	char line[80];
+	int  n;
+	int  x = 2, y = 2;
+	const int lh = 9;                    /* 8px glyph + 1px leading */
+
+	/* Panel behind the text: 480p is a noisy background for 8px glyphs. */
+	tev_flat();
+	rect(0, 0, 132, lh * 7 + 4, 0, 0, 0, 150);
+
+	/* Free heap first: it is the number that governs everything else. Amber
+	 * under 4 MB (the entity/network/font reserve the plan budgets for), red
+	 * under 2 MB (the end-to-end floor). */
+	u32 kbFree = pf->heapFree / 1024;
+	u32 heapColor = kbFree < 2048 ? 0xFF5555FFu
+	              : kbFree < 4096 ? 0xFFAA00FFu : 0x55FF55FFu;
+	n = 0;
+	app_str(line, sizeof line, &n, "heap ");
+	app_kb(line, sizeof line, &n, pf->heapFree);
+	app_str(line, sizeof line, &n, " low ");
+	app_kb(line, sizeof line, &n, pf->heapLow);
+	Hud_DrawStringShadow(line, x, y, heapColor); y += lh;
+
+	/* A vsync-locked frame is 16.67 ms, so that is the healthy reading, not the
+	 * failure one -- the next step up is a dropped field at 33.3 ms. Flag past
+	 * 18 ms, which can only mean fields are starting to slip. */
+	n = 0;
+	app_str(line, sizeof line, &n, "frame ");
+	app_ms(line, sizeof line, &n, pf->frameMsAvg);
+	app_str(line, sizeof line, &n, " max ");
+	app_ms(line, sizeof line, &n, pf->frameMsMax);
+	Hud_DrawStringShadow(line, x, y,
+	                     pf->frameMsAvg > 18.0f ? 0xFF5555FFu : 0xFFFFFFFFu);
+	y += lh;
+
+	n = 0;
+	app_str(line, sizeof line, &n, "tick ");
+	app_ms(line, sizeof line, &n, pf->tickMs);
+	app_str(line, sizeof line, &n, " max ");
+	app_ms(line, sizeof line, &n, pf->tickMsMax);
+	Hud_DrawStringShadow(line, x, y, 0xFFFFFFFFu); y += lh;
+
+	n = 0;
+	app_str(line, sizeof line, &n, "remesh ");
+	app_ms(line, sizeof line, &n, pf->w.remeshMs);
+	app_str(line, sizeof line, &n, " max ");
+	app_ms(line, sizeof line, &n, pf->w.remeshMsMax);
+	Hud_DrawStringShadow(line, x, y, 0xFFFFFFFFu); y += lh;
+
+	/* Display lists: drawn / total chunks, and what they cost. `dl` is the
+	 * allocation; `use` is what was actually recorded into it, so the gap is
+	 * the over-allocation T4 trims. */
+	n = 0;
+	app_str(line, sizeof line, &n, "chunk ");
+	app_int(line, sizeof line, &n, (int)pf->w.chunksDrawn);
+	app_str(line, sizeof line, &n, "/");
+	app_int(line, sizeof line, &n, (int)pf->w.chunks);
+	app_str(line, sizeof line, &n, " dl ");
+	app_kb(line, sizeof line, &n, pf->w.dlBytes);
+	app_str(line, sizeof line, &n, " use ");
+	app_kb(line, sizeof line, &n, pf->w.dlUsed);
+	Hud_DrawStringShadow(line, x, y, 0xFFFFFFFFu); y += lh;
+
+	/* Both indexed arrays are GX_INDEX16-addressed and append-only: past
+	 * 65535 entries a new tile would silently alias an existing one. */
+	n = 0;
+	app_str(line, sizeof line, &n, "clr ");
+	app_int(line, sizeof line, &n, (int)pf->w.clrCount);
+	app_str(line, sizeof line, &n, " tex ");
+	app_int(line, sizeof line, &n, (int)pf->w.texCount);
+	app_str(line, sizeof line, &n, "/65535");
+	Hud_DrawStringShadow(line, x, y,
+	                     pf->w.texCount > 60000 ? 0xFF5555FFu : 0xFFFFFFFFu);
+	y += lh;
+
+	n = 0;
+	app_str(line, sizeof line, &n, "face ");
+	app_int(line, sizeof line, &n, (int)pf->w.faces);
+	app_str(line, sizeof line, &n, " ent ");
+	app_int(line, sizeof line, &n, (int)pf->entities);
+	app_str(line, sizeof line, &n, " edit ");
+	app_int(line, sizeof line, &n, (int)pf->w.edits);
+	Hud_DrawStringShadow(line, x, y, 0xFFFFFFFFu);
+
+	(void)sc;
+	Hud_End2D();
 }
