@@ -28,6 +28,10 @@
 #define JUMP_UPWARDS_MOTION 0.41999998688697815  /* getJumpUpwardsMotion()   */
 #define JUMP_COOLDOWN_TICKS 10
 
+/* EntityLivingBase.maxHurtResistantTime: ticks of invulnerability after a hit
+ * (the damage test uses half of this). */
+#define MAX_HURT_RESISTANT_TIME 20
+
 /* moveFlying's magic constant is exactly (0.6*0.91)^3, so on default ground
  * the acceleration factor 0.16277136/f4^3 reduces to 1.0. */
 #define MOVE_FLYING_CONST   0.16277136
@@ -334,6 +338,58 @@ static void moveWithHeading(Player *p, const World *w,
 	p->motionZ *= f4;
 }
 
+/* ---- health / fall damage (EntityLivingBase + Entity, 1.8.9) ----------- */
+
+void Player_Damage(Player *p, float amount) {
+	/* attackEntityFrom: dead entities and (here) the invulnerability window. */
+	if (p->health <= 0.0f) return;
+
+	if ((float)p->hurtResistantTime > (float)MAX_HURT_RESISTANT_TIME / 2.0f) {
+		/* still invulnerable: only the *extra* over the last hit lands */
+		if (amount <= p->lastDamage) return;
+		p->health -= (amount - p->lastDamage);   /* damageEntity(amount-last) */
+		p->lastDamage = amount;
+	} else {
+		p->lastDamage = amount;
+		p->hurtResistantTime = MAX_HURT_RESISTANT_TIME;
+		p->health -= amount;                     /* damageEntity(amount) */
+	}
+
+	/* setHealth clamps to [0, maxHealth] */
+	if (p->health < 0.0f) p->health = 0.0f;
+	if (p->health > PLAYER_MAX_HEALTH) p->health = PLAYER_MAX_HEALTH;
+}
+
+/* EntityLivingBase.fall: distance over 3 blocks turns into half-heart damage. */
+static void player_fall(Player *p, float distance) {
+	int i = (int)ceil((double)distance - 3.0);   /* ceiling_float_int(distance-3) */
+	if (i > 0) Player_Damage(p, (float)i);
+}
+
+/* Entity.updateFallState: accumulate fall height while airborne, cash it in on
+ * landing. `dy` is the actual vertical displacement resolved this tick. */
+static void updateFallState(Player *p, double dy) {
+	if (p->onGround) {
+		if (p->fallDistance > 0.0f) {
+			player_fall(p, p->fallDistance);
+			p->fallDistance = 0.0f;
+		}
+	} else if (dy < 0.0) {
+		p->fallDistance -= (float)dy;
+	}
+}
+
+static void player_respawn(Player *p) {
+	p->x = p->spawnX; p->y = p->spawnY; p->z = p->spawnZ;
+	p->prevX = p->x; p->prevY = p->y; p->prevZ = p->z;
+	p->motionX = p->motionY = p->motionZ = 0.0;
+	p->onGround = 0;
+	p->health = PLAYER_MAX_HEALTH;
+	p->fallDistance = 0.0f;
+	p->hurtResistantTime = 0;
+	p->lastDamage = 0.0f;
+}
+
 /* ---- input ------------------------------------------------------------ */
 static float deadzone(int raw) {
 	if (raw >  STICK_DEADZONE) return (float)(raw - STICK_DEADZONE) / (127 - STICK_DEADZONE);
@@ -354,6 +410,13 @@ void Player_Spawn(Player *p, const World *w) {
 	p->isCollidedVertically = 0;
 	p->jumpTicks = 0;
 	p->sprinting = 0;
+
+	p->spawnX = p->x; p->spawnY = p->y; p->spawnZ = p->z;
+	p->health = PLAYER_MAX_HEALTH;
+	p->fallDistance = 0.0f;
+	p->hurtResistantTime = 0;
+	p->lastDamage = 0.0f;
+	Inventory_Init(&p->inventory);
 }
 
 void Player_Look(Player *p, int chan) {
@@ -363,12 +426,14 @@ void Player_Look(Player *p, int chan) {
 	if (p->pitch < -PITCH_LIMIT) p->pitch = -PITCH_LIMIT;
 }
 
-void Player_Tick(Player *p, const World *w, int chan) {
+void Player_Tick(Player *p, const World *w, int chan, int frozen) {
 	p->prevX = p->x;
 	p->prevY = p->y;
 	p->prevZ = p->z;
 
 	if (p->jumpTicks > 0) p->jumpTicks--;
+	/* EntityLivingBase.onEntityUpdate: tick down the post-hit invuln window. */
+	if (p->hurtResistantTime > 0) p->hurtResistantTime--;
 
 	/* Minecraft's MovementInputFromOptions maps the WASD keys to moveForward/
 	 * moveStrafe of exactly +/-1 (keyboard input is binary). The GameCube
@@ -389,6 +454,10 @@ void Player_Tick(Player *p, const World *w, int chan) {
 	int sneak = (held & PAD_BUTTON_B) != 0;
 	/* sprint on R: the digital click or the analog trigger past a threshold */
 	int sprintHeld = (held & PAD_TRIGGER_R) != 0 || PAD_TriggerR(chan) > SPRINT_TRIGGER;
+
+	/* Inventory screen open (or otherwise gated): drop all control input but
+	 * keep simulating so gravity/friction still settle the player. */
+	if (frozen) { forward = strafe = 0.0f; jump = sneak = 0; sprintHeld = 0; }
 
 	/* Sprint requires walking forward and not sneaking (EntityPlayerSP). */
 	if (sprintHeld && forward > 0.0f && !sneak) p->sprinting = 1;
@@ -415,7 +484,17 @@ void Player_Tick(Player *p, const World *w, int chan) {
 	strafe  *= 0.98f;
 	forward *= 0.98f;
 
+	double preY = p->y;
 	moveWithHeading(p, w, strafe, forward, sneak);
+
+	/* Entity.updateFallState is called from moveEntity with the resolved
+	 * vertical displacement; do it here with the same delta once per tick. */
+	updateFallState(p, p->y - preY);
+
+	/* Minimal death handling: fall damage is currently the only way to lose
+	 * health, so a lethal fall just respawns at the spawn point with full
+	 * health. (No item drops -- the inventory pickup path doesn't exist yet.) */
+	if (p->health <= 0.0f) player_respawn(p);
 }
 
 void Player_GetViewMatrix(const Player *p, float alpha, Mtx v) {

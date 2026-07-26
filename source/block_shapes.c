@@ -176,12 +176,97 @@ int BlockShape_Boxes(u8 shape, u8 param, u8 connectMask, BlockAABB out[2]) {
 		}
 		return 1;
 	}
+	case SHAPE_CROSS:
+	case SHAPE_TORCH:
+	case SHAPE_LADDER:
+	case SHAPE_VINE:
+	case SHAPE_PLATE:
+		/* All passable in vanilla -- flowers/grass/saplings, torches, ladders
+		 * (their climb is a separate non-collision effect), vines, and pressure
+		 * plates every return null from getCollisionBoundingBox, so the player
+		 * walks straight through. Returning 0 boxes makes World_BlockBoxes /
+		 * player.c treat them exactly as air, which is the point. */
+		return 0;
+	case SHAPE_CHEST:
+		/* BlockChest.setBlockBounds(0.0625,0, 0.0625, 0.9375,0.875,0.9375):
+		 * a full-footprint solid box, 14/16 tall, inset 1px on the sides. */
+		out[0] = (BlockAABB){0.0625f, 0.0f, 0.0625f, 0.9375f, 0.875f, 0.9375f};
+		return 1;
+	case SHAPE_SKULL: {
+		/* meta & 7 = EnumFacing.getFront: 1=UP(on floor), 2..5 = wall mounts
+		 * (2=+Z 3=-Z 4=+X 5=-X wall). A floor skull is an 8x8x8 head sitting on
+		 * the ground; a wall skull is that head raised to mid-height and pushed
+		 * flush against its wall (BlockSkull.setBlockBoundsBasedOnState). */
+		int meta = param & 7;
+		switch (meta) {
+		case 2:  out[0] = (BlockAABB){0.25f, 0.25f, 0.5f, 0.75f, 0.75f, 1.0f}; break;
+		case 3:  out[0] = (BlockAABB){0.25f, 0.25f, 0.0f, 0.75f, 0.75f, 0.5f}; break;
+		case 4:  out[0] = (BlockAABB){0.5f, 0.25f, 0.25f, 1.0f, 0.75f, 0.75f}; break;
+		case 5:  out[0] = (BlockAABB){0.0f, 0.25f, 0.25f, 0.5f, 0.75f, 0.75f}; break;
+		default: out[0] = (BlockAABB){0.25f, 0.0f, 0.25f, 0.75f, 0.5f, 0.75f}; break;
+		}
+		return 1;
+	}
 	case SHAPE_CUBE:
 	default:
 		/* Also the safe fallback for shapes not yet implemented: collide as
 		 * a full cube rather than leaving the block silently walk-through. */
 		out[0] = (BlockAABB){0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
 		return 1;
+	}
+}
+
+int BlockShape_SelectBoxes(u8 shape, u8 param, u8 connectMask, BlockAABB out[2]) {
+	int n = BlockShape_Boxes(shape, param, connectMask, out);
+	if (n) return n;
+
+	/* The passable shapes, using vanilla's setBlockBounds (which is what
+	 * getSelectedBoundingBox is built from) rather than their empty
+	 * collision box. */
+	switch (shape) {
+	case SHAPE_CROSS:
+		/* BlockBush.setBlockBounds(0.3, 0, 0.3, 0.7, 0.8, 0.7) */
+		out[0] = (BlockAABB){0.3f, 0.0f, 0.3f, 0.7f, 0.8f, 0.7f};
+		return 1;
+	case SHAPE_TORCH: {
+		/* BlockTorch.setBlockBoundsBasedOnState: meta 1=E 2=W 3=S 4=N wall
+		 * mounts, anything else stands on the floor. */
+		switch (param & 7) {
+		case 1:  out[0] = (BlockAABB){0.0f,   0.2f, 0.35f, 0.3f,  0.8f, 0.65f}; break;
+		case 2:  out[0] = (BlockAABB){0.7f,   0.2f, 0.35f, 1.0f,  0.8f, 0.65f}; break;
+		case 3:  out[0] = (BlockAABB){0.35f,  0.2f, 0.0f,  0.65f, 0.8f, 0.3f};  break;
+		case 4:  out[0] = (BlockAABB){0.35f,  0.2f, 0.7f,  0.65f, 0.8f, 1.0f};  break;
+		default: out[0] = (BlockAABB){0.4f,   0.0f, 0.4f,  0.6f,  0.6f, 0.6f};  break;
+		}
+		return 1;
+	}
+	case SHAPE_LADDER: {
+		/* BlockLadder: a 2/16 slab flush against the wall it hangs on
+		 * (facing meta 2=N 3=S 4=W 5=E, same as the mesh emitter). */
+		switch (param & 7) {
+		case 2:  out[0] = (BlockAABB){0.0f,   0.0f, 0.875f, 1.0f,   1.0f, 1.0f};  break;
+		case 3:  out[0] = (BlockAABB){0.0f,   0.0f, 0.0f,   1.0f,   1.0f, 0.125f};break;
+		case 4:  out[0] = (BlockAABB){0.875f, 0.0f, 0.0f,   1.0f,   1.0f, 1.0f};  break;
+		default: out[0] = (BlockAABB){0.0f,   0.0f, 0.0f,   0.125f, 1.0f, 1.0f};  break;
+		}
+		return 1;
+	}
+	case SHAPE_VINE:
+	case SHAPE_PLATE:
+		/* Vines hug whichever walls they're attached to and pressure plates
+		 * are a thin floor pad; a single full-footprint thin box is enough to
+		 * aim at either, and is what BlockVine's own bounds collapse to when
+		 * it's attached on all sides. */
+		out[0] = (shape == SHAPE_PLATE)
+		       ? (BlockAABB){0.0625f, 0.0f, 0.0625f, 0.9375f, 0.0625f, 0.9375f}
+		       : (BlockAABB){0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
+		return 1;
+	case SHAPE_FENCE_GATE:
+		/* An open gate has no collision but is still targetable. */
+		out[0] = (BlockAABB){0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
+		return 1;
+	default:
+		return 0;
 	}
 }
 
@@ -201,10 +286,24 @@ static u32 emit_box(s16 x0, s16 y0, s16 z0, s16 x1, s16 y1, s16 z1,
 	for (f = 0; f < 6; f++) {
 		if (skipMask & (u8)(1u << f)) continue;
 		int tile = (f == 3) ? tileTop : (f == 2) ? tileBottom : tileSide;
-		emit(ctx, f, x0, y0, z0, x1, y1, z1, tile);
+		emit(ctx, f, x0, y0, z0, x1, y1, z1, tile, 0);
 		n++;
 	}
 	return n;
+}
+
+/* Emit a box, optionally mirroring its X and Z extents first. The custom
+ * shapes that are authored facing one way (anvil, fence gate) are symmetric
+ * front-to-back, so a plain X<->Z swap rotates the whole model 90deg for the
+ * perpendicular facing without needing a real rotation matrix. */
+static u32 emit_box_axis(int swapXZ, s16 x0, s16 y0, s16 z0, s16 x1, s16 y1, s16 z1,
+                         int tileSide, int tileTop, int tileBottom, u8 skipMask,
+                         BlockQuadFn emit, void *ctx) {
+	if (swapXZ)
+		return emit_box(z0, y0, x0, z1, y1, x1, tileSide, tileTop, tileBottom,
+		                skipMask, emit, ctx);
+	return emit_box(x0, y0, z0, x1, y1, z1, tileSide, tileTop, tileBottom,
+	                skipMask, emit, ctx);
 }
 
 static u32 mesh_slab(u8 param, int g, BlockQuadFn emit, void *ctx) {
@@ -270,38 +369,56 @@ static u32 mesh_stair(u8 param, int g, BlockQuadFn emit, void *ctx) {
 	return n;
 }
 
-/* Fence/gate/wall render as solid beams matching their collision boxes
- * exactly (see BlockShape_Boxes) rather than vanilla's separate thin
- * top/bottom rail quads -- a deliberate visual simplification (still reads
- * clearly as a fence/wall, especially at this project's texture
- * resolution) that keeps the same box math doing double duty for mesh and
- * collision. Overlapping boxes (e.g. a 4-way fence connection) cost a
- * little harmless overdraw, not a visual artifact -- see cb_face's "why no
- * face-culling for custom shapes" comment in world.c. */
+/* Real fence geometry -- a 4x4 centre post plus, for each connected side, a
+ * pair of thin rails (a lower and an upper bar) -- ground-truthed against
+ * block/fence_post.json (post [6,0,6..10,16,10]) and block/fence_n.json (bars
+ * at y6..9 and y12..15, cross-section 2). An isolated fence is just the post,
+ * exactly like vanilla. Rendered 16 tall (vanilla's model height) even though
+ * collision is 1.5 blocks (BlockShape_Boxes' SHAPE_FENCE); a taller mesh would
+ * also push side UVs off the top of the tile. Each rail runs from the block
+ * edge to the post centre (8) and pokes 2px into the post rather than butting
+ * it flush, so the post always hides the rail's inner end -- no coincident
+ * internal faces to z-fight. connectMask: bit0=-X 1=+X 2=-Z 3=+Z. */
 static u32 mesh_fence(u8 connectMask, int g, BlockQuadFn emit, void *ctx) {
 	int connW = connectMask & 1, connE = (connectMask >> 1) & 1;
 	int connN = (connectMask >> 2) & 1, connS = (connectMask >> 3) & 1;
-	int tileTop = g_topTile[g], tileBottom = g_bottomTile[g];
+	int tt = g_topTile[g], tb = g_bottomTile[g];
 	u32 n = 0;
-	if (connN || connS) {
-		s16 z0 = connN ? 0 : 6, z1 = connS ? 16 : 10;
-		n += emit_box(6, 0, z0, 10, 24, z1, g, tileTop, tileBottom, 0, emit, ctx);
-	}
-	if (connW || connE || (!connN && !connS)) {
-		s16 x0 = connW ? 0 : 6, x1 = connE ? 16 : 10;
-		n += emit_box(x0, 0, 6, x1, 24, 10, g, tileTop, tileBottom, 0, emit, ctx);
-	}
+	n += emit_box(6, 0, 6, 10, 16, 10, g, tt, tb, 0, emit, ctx); /* centre post */
+	if (connN) { n += emit_box(7, 6, 0, 9, 9, 8, g, tt, tb, 0, emit, ctx);
+	             n += emit_box(7, 12, 0, 9, 15, 8, g, tt, tb, 0, emit, ctx); }
+	if (connS) { n += emit_box(7, 6, 8, 9, 9, 16, g, tt, tb, 0, emit, ctx);
+	             n += emit_box(7, 12, 8, 9, 15, 16, g, tt, tb, 0, emit, ctx); }
+	if (connW) { n += emit_box(0, 6, 7, 8, 9, 9, g, tt, tb, 0, emit, ctx);
+	             n += emit_box(0, 12, 7, 8, 15, 9, g, tt, tb, 0, emit, ctx); }
+	if (connE) { n += emit_box(8, 6, 7, 16, 9, 9, g, tt, tb, 0, emit, ctx);
+	             n += emit_box(8, 12, 7, 16, 15, 9, g, tt, tb, 0, emit, ctx); }
 	return n;
 }
 
+/* The real closed-gate frame -- two end posts, a merged centre post, and an
+ * upper+lower bar on each side -- ground-truthed against
+ * block/fence_gate_closed.json. The canonical model spans X (thin in Z at
+ * 7..9); facing WEST/EAST swaps X<->Z. (Vanilla's two adjacent inner posts
+ * [6..8]/[8..10] are merged into one [6..10] centre post -- we don't
+ * reproduce their per-part UVs, so the split served no purpose.) Open gates
+ * aren't animated swinging against the post, so they render as an empty gap,
+ * matching their 0 collision boxes. */
 static u32 mesh_fence_gate(u8 param, int g, BlockQuadFn emit, void *ctx) {
 	int facing = param & 3;
 	int open = (param & 4) != 0;
-	if (open) return 0; /* invisible gap when open, matching 0 collision boxes */
-	int axisZ = (facing % 2) == 0;
-	int tileTop = g_topTile[g], tileBottom = g_bottomTile[g];
-	return axisZ ? emit_box(0, 0, 6, 16, 24, 10, g, tileTop, tileBottom, 0, emit, ctx)
-	             : emit_box(6, 0, 0, 10, 24, 16, g, tileTop, tileBottom, 0, emit, ctx);
+	if (open) return 0;
+	int swap = (facing % 2) != 0;   /* WEST/EAST -> gate spans Z */
+	int tt = g_topTile[g], tb = g_bottomTile[g];
+	u32 n = 0;
+	n += emit_box_axis(swap,  0, 5, 7,  2, 16, 9, g, tt, tb, 0, emit, ctx); /* left post  */
+	n += emit_box_axis(swap, 14, 5, 7, 16, 16, 9, g, tt, tb, 0, emit, ctx); /* right post */
+	n += emit_box_axis(swap,  6, 6, 7, 10, 15, 9, g, tt, tb, 0, emit, ctx); /* centre post*/
+	n += emit_box_axis(swap,  2, 6, 7,  6,  9, 9, g, tt, tb, 0, emit, ctx); /* lower left */
+	n += emit_box_axis(swap,  2,12, 7,  6, 15, 9, g, tt, tb, 0, emit, ctx); /* upper left */
+	n += emit_box_axis(swap, 10, 6, 7, 14,  9, 9, g, tt, tb, 0, emit, ctx); /* lower right*/
+	n += emit_box_axis(swap, 10,12, 7, 14, 15, 9, g, tt, tb, 0, emit, ctx); /* upper right*/
+	return n;
 }
 
 /* Mirrors BlockShape_Boxes' SHAPE_PANE case exactly (same up-to-2-box
@@ -329,12 +446,28 @@ static u32 mesh_pane(u8 connectMask, int g, BlockQuadFn emit, void *ctx) {
 	return n;
 }
 
+/* The real anvil silhouette -- wide base, a lower lip, a thin waist, and the
+ * wide face/horn top -- as 4 stacked boxes, ground-truthed against
+ * block/anvil.json (base [2,0,2..14,4,14], lower lip [4,4,3..12,5,13], waist
+ * [6,5,4..10,10,12], top [3,10,0..13,16,16]). The canonical model's long axis
+ * (the top/horn) runs along Z; facing WEST/EAST swaps X<->Z so it runs along X
+ * instead, matching BlockShape_Boxes' SHAPE_ANVIL axis choice. Damage (bits2+)
+ * only changes the top texture in vanilla, not the shape, so it's ignored.
+ * Only the top box's up-face uses the anvil working-surface texture
+ * (ANVIL_TOP_TILE, vanilla's #top); every other face uses anvil_base (the
+ * side tile g). The box-projected UV for that up-face lands on the tile's
+ * [3..13]x[0..16] region -- exactly vanilla anvil.json's #top uv -- so it maps
+ * 1:1 (bar the 180deg spin vanilla adds, which this no-rotation engine skips). */
 static u32 mesh_anvil(u8 param, int g, BlockQuadFn emit, void *ctx) {
 	int facing = param & 3;
-	int axisX = (facing % 2) != 0;
-	int tileTop = g_topTile[g], tileBottom = g_bottomTile[g];
-	return axisX ? emit_box(0, 0, 2, 16, 16, 14, g, tileTop, tileBottom, 0, emit, ctx)
-	             : emit_box(2, 0, 0, 14, 16, 16, g, tileTop, tileBottom, 0, emit, ctx);
+	int swap = (facing % 2) != 0;   /* WEST/EAST -> long axis along X */
+	int tb = g_bottomTile[g];
+	u32 n = 0;
+	n += emit_box_axis(swap, 2, 0,  2, 14,  4, 14, g, g, tb, 0, emit, ctx); /* base */
+	n += emit_box_axis(swap, 4, 4,  3, 12,  5, 13, g, g, tb, 0, emit, ctx); /* lip  */
+	n += emit_box_axis(swap, 6, 5,  4, 10, 10, 12, g, g, tb, 0, emit, ctx); /* waist*/
+	n += emit_box_axis(swap, 3, 10, 0, 13, 16, 16, g, ANVIL_TOP_TILE, tb, 0, emit, ctx); /* top */
+	return n;
 }
 
 /* The table itself, plus a small static floating book box (fixed position,
@@ -348,17 +481,46 @@ static u32 mesh_anvil(u8 param, int g, BlockQuadFn emit, void *ctx) {
  * matching vanilla where the book is a TESR visual only). */
 static u32 mesh_enchant_table(int g, BlockQuadFn emit, void *ctx) {
 	u32 n = emit_box(0, 0, 0, 16, 12, 16, g, g_topTile[g], g_bottomTile[g], 0, emit, ctx);
-	n += emit_box(5, 13, 6, 11, 15, 10, ENCHANT_BOOK_TILE, ENCHANT_BOOK_TILE,
-	              ENCHANT_BOOK_TILE, 0, emit, ctx);
+	/* Floating book: a small closed book, static (no bob/spin/page-flip and no
+	 * tilt -- this engine has no rotation). Leather cover on the two flat faces
+	 * (up f==3 / down f==2), white page edges on the four sides. Emitted
+	 * directly (not via emit_box) with whole=1 so each purpose-made crop
+	 * (ENCHANT_BOOK_COVER_TILE / _PAGES_TILE, see tools/build_atlas.py's
+	 * load_book_tiles) fills its whole face; the grid-aligned projection
+	 * emit_box uses would map only a few texels of that crop onto each face.
+	 * See BlockQuadFn's `whole` doc in block_shapes.h. */
+	int f;
+	for (f = 0; f < 6; f++) {
+		int tile = (f == 2 || f == 3) ? ENCHANT_BOOK_COVER_TILE : ENCHANT_BOOK_PAGES_TILE;
+		emit(ctx, f, 5, 13, 5, 11, 15, 11, tile, 1);
+		n++;
+	}
 	return n;
 }
 
+/* Real wall geometry -- an 8x8x16 centre post plus a 6-wide, 13-tall bar
+ * reaching toward each connected side -- ground-truthed against
+ * block/wall_post.json (post [4,0,4..12,16,12]) and block/wall_n.json (side
+ * bar [5,0,0..11,13,4]). The "narrowed straight run": when a wall connects on
+ * exactly two opposite sides and nothing else, vanilla drops the tall post and
+ * renders one continuous low bar (block/wall_ns.json). We can't see whether a
+ * block sits on top (vanilla's other reason to keep the post), so we assume
+ * not -- correct for open straight runs, the common case. connectMask:
+ * bit0=-X 1=+X 2=-Z 3=+Z. */
 static u32 mesh_wall(u8 connectMask, int g, BlockQuadFn emit, void *ctx) {
 	int connW = connectMask & 1, connE = (connectMask >> 1) & 1;
 	int connN = (connectMask >> 2) & 1, connS = (connectMask >> 3) & 1;
-	s16 x0 = connW ? 0 : 4, x1 = connE ? 16 : 12;
-	s16 z0 = connN ? 0 : 4, z1 = connS ? 16 : 12;
-	return emit_box(x0, 0, z0, x1, 16, z1, g, g_topTile[g], g_bottomTile[g], 0, emit, ctx);
+	int tt = g_topTile[g], tb = g_bottomTile[g];
+	if (connN && connS && !connW && !connE)
+		return emit_box(5, 0, 0, 11, 13, 16, g, tt, tb, 0, emit, ctx); /* N-S run */
+	if (connW && connE && !connN && !connS)
+		return emit_box(0, 0, 5, 16, 13, 11, g, tt, tb, 0, emit, ctx); /* W-E run */
+	u32 n = emit_box(4, 0, 4, 12, 16, 12, g, tt, tb, 0, emit, ctx);    /* post */
+	if (connN) n += emit_box(5, 0, 0, 11, 13, 4, g, tt, tb, 0, emit, ctx);
+	if (connS) n += emit_box(5, 0, 12, 11, 13, 16, g, tt, tb, 0, emit, ctx);
+	if (connW) n += emit_box(0, 0, 5, 4, 13, 11, g, tt, tb, 0, emit, ctx);
+	if (connE) n += emit_box(12, 0, 5, 16, 13, 11, g, tt, tb, 0, emit, ctx);
+	return n;
 }
 
 static u32 mesh_trapdoor(u8 param, int g, BlockQuadFn emit, void *ctx) {
@@ -391,8 +553,119 @@ static u32 mesh_door(u8 param, int g, BlockQuadFn emit, void *ctx) {
 	}
 }
 
+/* Two diagonal crossed planes spanning the block corner-to-corner, the vanilla
+ * block/cross model (flowers, saplings, dead bush) and block/tallgrass (grass,
+ * fern) -- both are the same two-quad cross, just different textures. Emitted
+ * via the free-quad path because the planes are 45deg, not axis-aligned box
+ * faces. `g` already resolves to the (biome-tinted where relevant) plant tile,
+ * and for a DOUBLE_PLANT half it's that half's own top/bottom cross texture.
+ * No top/bottom faces exist, so g_topTile/g_bottomTile don't apply. Culling is
+ * off, so each plane's single quad shows from both sides. */
+static u32 mesh_cross(int g, BlockFreeQuadFn ef, void *ctx) {
+	ef(ctx, 0, 0, 0, 16, 0, 16, 16, 16, 16, 0, 16, 0, g);  /* NW<->SE diagonal */
+	ef(ctx, 16, 0, 0, 0, 0, 16, 0, 16, 16, 16, 16, 0, g);  /* NE<->SW diagonal */
+	return 2;
+}
+
+/* The vanilla torch is two full-tile crossed billboards (block/torch's two thin
+ * planes at x[7,9] and z[7,9]); the torch_on texture is mostly transparent with
+ * the stick+flame down its centre column, so alpha-cutout planes read as a
+ * torch. whole=1 forces the full tile onto each plane (the box projection would
+ * otherwise clip it to a sliver, and would sample outside the tile once the
+ * wall offset below pushes coords negative). This engine has no rotation, so
+ * wall torches (meta 1..4, BlockTorch.getStateFromMeta: 1=E 2=W 3=S 4=N facing)
+ * aren't tilted -- instead the whole model is shoved against its support wall
+ * (opposite its facing) and raised a little, a bounded approximation like the
+ * project's other non-rotating shapes. meta 5 = standing on the floor. */
+static u32 mesh_torch(u8 param, int g, BlockQuadFn emit, void *ctx) {
+	int meta = param & 7;
+	s16 dx = 0, dy = 0, dz = 0;
+	switch (meta) {
+	case 1: dx = -6; dy = 3; break; /* facing E -> against west (-X) wall  */
+	case 2: dx =  6; dy = 3; break; /* facing W -> against east (+X) wall  */
+	case 3: dz = -6; dy = 3; break; /* facing S -> against north (-Z) wall */
+	case 4: dz =  6; dy = 3; break; /* facing N -> against south (+Z) wall */
+	default: break;                 /* 5 = standing, centred               */
+	}
+	/* x-plane (west/east faces) and z-plane (north/south faces); both full-tile */
+	emit(ctx, 0, (s16)(dx+7), (s16)(dy+0), (s16)(dz+0), (s16)(dx+9), (s16)(dy+16), (s16)(dz+16), g, 1);
+	emit(ctx, 1, (s16)(dx+7), (s16)(dy+0), (s16)(dz+0), (s16)(dx+9), (s16)(dy+16), (s16)(dz+16), g, 1);
+	emit(ctx, 4, (s16)(dx+0), (s16)(dy+0), (s16)(dz+7), (s16)(dx+16), (s16)(dy+16), (s16)(dz+9), g, 1);
+	emit(ctx, 5, (s16)(dx+0), (s16)(dy+0), (s16)(dz+7), (s16)(dx+16), (s16)(dy+16), (s16)(dz+9), g, 1);
+	return 4;
+}
+
+/* A single ladder plane flush against one wall (block/ladder: a plane at 15.2
+ * on the wall the ladder's facing points away from). param = BlockLadder facing
+ * meta (2=N 3=S 4=W 5=E). We emit just the one inner face of a 1px-thick box on
+ * that wall (culling off makes it double-sided), with whole=1 for the full
+ * ladder tile. Passable -- see BlockShape_Boxes' SHAPE_LADDER (no collision). */
+static u32 mesh_ladder(u8 param, int g, BlockQuadFn emit, void *ctx) {
+	int facing = param & 7;
+	switch (facing) {
+	case 3:  emit(ctx, 5, 0, 0, 0, 16, 16, 1, g, 1); break;   /* faces +Z, on -Z wall */
+	case 4:  emit(ctx, 0, 15, 0, 0, 16, 16, 16, g, 1); break; /* faces -X, on +X wall */
+	case 5:  emit(ctx, 1, 0, 0, 0, 1, 16, 16, g, 1); break;   /* faces +X, on -X wall */
+	default: emit(ctx, 4, 0, 0, 15, 16, 16, 16, g, 1); break; /* N: faces -Z, on +Z wall */
+	}
+	return 1;
+}
+
+/* Vine planes, one per set metadata bit (BlockVine: 1=S 2=W 4=N 8=E, each a
+ * plane flush against that wall -- block/vine_1 etc.). A vine's meta can carry
+ * several sides at once (e.g. 12 = N+E). Same single-inner-face + whole=1 trick
+ * as the ladder; a bare 0 (only the computed "up" section vanilla derives, not
+ * stored in meta) falls back to one +Z plane so it never vanishes. Passable. */
+static u32 mesh_vine(u8 param, int g, BlockQuadFn emit, void *ctx) {
+	u32 n = 0;
+	if (param & 1) { emit(ctx, 4, 0, 0, 15, 16, 16, 16, g, 1); n++; } /* S -> +Z wall */
+	if (param & 2) { emit(ctx, 1, 0, 0, 0, 1, 16, 16, g, 1); n++; }   /* W -> -X wall */
+	if (param & 4) { emit(ctx, 5, 0, 0, 0, 16, 16, 1, g, 1); n++; }   /* N -> -Z wall */
+	if (param & 8) { emit(ctx, 0, 15, 0, 0, 16, 16, 16, g, 1); n++; } /* E -> +X wall */
+	if (n == 0) { emit(ctx, 4, 0, 0, 15, 16, 16, 16, g, 1); n++; }
+	return n;
+}
+
+/* Pressure plate: block/pressure_plate_up, a thin 14x1x14 slab inset 1px,
+ * sitting on the floor. The down (-Y) face is hidden against the block below,
+ * so it's skipped. Box-projected UVs land on the plate texture's [1..15]
+ * region, matching vanilla's model UVs. Passable (no collision). */
+static u32 mesh_plate(int g, BlockQuadFn emit, void *ctx) {
+	return emit_box(1, 0, 1, 15, 1, 15, g, g_topTile[g], g_bottomTile[g],
+	                (u8)(1 << 2), emit, ctx);
+}
+
+/* Chest as a plain inset solid box matching its collision (BlockChest bounds).
+ * Vanilla renders chests as an animated TESR entity model with a dedicated
+ * unwrapped texture and a lid; this engine has neither, so a wood box (the
+ * CHEST id's planks tile) is a deliberate, non-interactable stand-in -- it
+ * reads as a chest-sized crate. Facing (param) is unused: the box is symmetric
+ * and every face uses the same tile. */
+static u32 mesh_chest(int g, BlockQuadFn emit, void *ctx) {
+	return emit_box(1, 0, 1, 15, 14, 15, g, g_topTile[g], g_bottomTile[g], 0, emit, ctx);
+}
+
+/* Skull as a small head box textured with the default Steve head crops
+ * (SKULL_*_TILE, built from entity/steve.png -- see tools/build_atlas.py). Real
+ * skulls are a TESR that also picks a player skin / rotates by nibble; per the
+ * task we just default every skull to Steve's head. Placement mirrors
+ * BlockShape_Boxes' SHAPE_SKULL (floor vs. the four wall mounts). */
+static u32 mesh_skull(u8 param, BlockQuadFn emit, void *ctx) {
+	int meta = param & 7;
+	s16 x0, y0, z0, x1, y1, z1;
+	switch (meta) {
+	case 2:  x0=4; y0=4; z0=8; x1=12; y1=12; z1=16; break; /* +Z wall */
+	case 3:  x0=4; y0=4; z0=0; x1=12; y1=12; z1=8;  break; /* -Z wall */
+	case 4:  x0=8; y0=4; z0=4; x1=16; y1=12; z1=12; break; /* +X wall */
+	case 5:  x0=0; y0=4; z0=4; x1=8;  y1=12; z1=12; break; /* -X wall */
+	default: x0=4; y0=0; z0=4; x1=12; y1=8;  z1=12; break; /* floor   */
+	}
+	return emit_box(x0, y0, z0, x1, y1, z1, SKULL_SIDE_TILE, SKULL_TOP_TILE,
+	                SKULL_BOTTOM_TILE, 0, emit, ctx);
+}
+
 u32 BlockShape_Mesh(u8 shape, u8 param, u8 connectMask, int g,
-                    BlockQuadFn emit, void *ctx) {
+                    BlockQuadFn emit, BlockFreeQuadFn emitFree, void *ctx) {
 	switch (shape) {
 	case SHAPE_SLAB:       return mesh_slab(param, g, emit, ctx);
 	case SHAPE_STAIR:      return mesh_stair(param, g, emit, ctx);
@@ -404,6 +677,13 @@ u32 BlockShape_Mesh(u8 shape, u8 param, u8 connectMask, int g,
 	case SHAPE_ENCHANT_TABLE: return mesh_enchant_table(g, emit, ctx);
 	case SHAPE_TRAPDOOR:   return mesh_trapdoor(param, g, emit, ctx);
 	case SHAPE_DOOR:       return mesh_door(param, g, emit, ctx);
+	case SHAPE_CROSS:      return mesh_cross(g, emitFree, ctx);
+	case SHAPE_TORCH:      return mesh_torch(param, g, emit, ctx);
+	case SHAPE_LADDER:     return mesh_ladder(param, g, emit, ctx);
+	case SHAPE_VINE:       return mesh_vine(param, g, emit, ctx);
+	case SHAPE_PLATE:      return mesh_plate(g, emit, ctx);
+	case SHAPE_CHEST:      return mesh_chest(g, emit, ctx);
+	case SHAPE_SKULL:      return mesh_skull(param, emit, ctx);
 	default:               return 0;
 	}
 }

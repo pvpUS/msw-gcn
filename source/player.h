@@ -3,6 +3,7 @@
 
 #include <gccore.h>
 #include "world.h"
+#include "inventory.h"
 
 /* A first-person player entity with Minecraft 1.8.9 movement physics
  * (EntityLivingBase.moveEntityWithHeading + Entity.moveEntity collision).
@@ -27,7 +28,28 @@ typedef struct {
 	int isCollidedVertically;
 	int jumpTicks;
 	int sprinting;
+
+	/* ---- health / damage (EntityLivingBase, 1.8.9) ------------------------
+	 * health is in half-heart units matching Minecraft (max 20 = 10 hearts).
+	 * Fall damage is currently the only source: fallDistance accumulates while
+	 * airborne (Entity.updateFallState) and is cashed in on landing. The
+	 * hurtResistantTime window (Entity/EntityLivingBase) gives brief post-hit
+	 * invulnerability so a single landing can't be counted twice. */
+	float health;
+	float fallDistance;
+	int   hurtResistantTime;
+	float lastDamage;
+
+	/* spawn point, cached for respawn-on-death (block units) */
+	double spawnX, spawnY, spawnZ;
+
+	/* EntityPlayer.inventory -- see inventory.h. Empty until the world becomes
+	 * breakable and the mining/pickup path starts filling it. */
+	Inventory inventory;
 } Player;
+
+/* Max health (SharedMonsterAttributes.maxHealth default): 20 = 10 hearts. */
+#define PLAYER_MAX_HEALTH 20.0f
 
 /* Place the player at the world's spawn point, looking forward, at rest. */
 void Player_Spawn(Player *p, const World *w);
@@ -36,8 +58,16 @@ void Player_Spawn(Player *p, const World *w);
 void Player_Look(Player *p, int chan);
 
 /* One 20 Hz physics tick: samples the movement stick + buttons, applies the
- * Minecraft movement/gravity/friction step and resolves block collisions. */
-void Player_Tick(Player *p, const World *w, int chan);
+ * Minecraft movement/gravity/friction step and resolves block collisions, and
+ * updates the fall-damage state. `frozen` (e.g. while the inventory screen is
+ * open) suppresses movement/jump input but still runs physics so the player
+ * settles under gravity. */
+void Player_Tick(Player *p, const World *w, int chan, int frozen);
+
+/* EntityLivingBase.attackEntityFrom + damageEntity, reduced to the no-armor/
+ * no-absorption case: applies `amount` half-hearts of damage, honoring the
+ * hurtResistantTime invulnerability window. */
+void Player_Damage(Player *p, float amount);
 
 /* Build the eye view matrix. `alpha` in [0,1] interpolates between the last
  * two ticks for smooth motion at the render frame rate. */

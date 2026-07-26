@@ -2,8 +2,57 @@
 #ifndef MSW_BLOCK_BOOK_GEN_H
 #define MSW_BLOCK_BOOK_GEN_H
 
-/* Atlas tile for the enchanting table's static floating book
- * (mesh_enchant_table in block_shapes.c). */
-#define ENCHANT_BOOK_TILE 628
+/* Extra atlas tiles that block_shapes.c's mesh emitters need by
+ * index (not part of the per-global-id side/top/bottom tables). */
+
+/* Enchanting table's static floating book (mesh_enchant_table):
+ * leather cover on its two flat faces, page edges on its sides. */
+#define ENCHANT_BOOK_COVER_TILE 628
+#define ENCHANT_BOOK_PAGES_TILE 629
+
+/* Anvil working-surface texture for the top box's up-face only
+ * (mesh_anvil); all other anvil faces use anvil_base. */
+#define ANVIL_TOP_TILE 630
+
+/* Default Steve head tiles for skulls (mesh_skull): front face
+ * on the 4 sides, plus the head's top and bottom. */
+#define SKULL_SIDE_TILE 631
+#define SKULL_TOP_TILE 632
+#define SKULL_BOTTOM_TILE 633
+
+/* Held/dropped ITEMS (not placeable blocks): the atlas tile
+ * index is used directly as the inventory ItemStack.item id.
+ * Being >= NUM_BLOCK_IDS is how helditem.c distinguishes a
+ * flat item from a block. See source/items.h for the tools'
+ * dig properties and block_props_gen.h for the drop tables. */
+#define ITEM_DIAMOND_SWORD_TILE 634
+#define ITEM_DIAMOND_PICKAXE_TILE 635
+#define ITEM_DIAMOND_AXE_TILE 636
+#define ITEM_DIAMOND_SHOVEL_TILE 637
+#define ITEM_COAL_TILE 638
+#define ITEM_DIAMOND_TILE 639
+#define ITEM_REDSTONE_TILE 640
+#define ITEM_QUARTZ_TILE 641
+#define ITEM_FLINT_TILE 642
+#define ITEM_CLAY_BALL_TILE 643
+#define ITEM_STRING_TILE 644
+#define ITEM_SNOWBALL_TILE 645
+#define ITEM_WHEAT_TILE 646
+#define ITEM_WHEAT_SEEDS_TILE 647
+#define ITEM_BOOK_TILE 648
+#define ITEM_SIGN_TILE 649
+#define ITEM_DOOR_WOOD_TILE 650
+#define ITEM_BED_TILE 651
+#define ITEM_COCOA_BEANS_TILE 652
+#define ITEM_NETHER_WART_TILE 653
+
+/* Block-breaking crack overlay: DESTROY_STAGE_TILE + stage,
+ * stage in 0..DESTROY_STAGE_COUNT-1 (vanilla destroy_stage_N). */
+#define DESTROY_STAGE_TILE 654
+#define DESTROY_STAGE_COUNT 10
+
+/* Total tiles packed into the atlas (block tiles + face
+ * overrides + the extras above); an id/tile past this is a bug. */
+#define NUM_ATLAS_TILES 664
 
 #endif

@@ -95,6 +95,13 @@ def load_tex(fname):
 def solid(rgb):
     return Image.new("RGBA", (TILE, TILE), (rgb[0], rgb[1], rgb[2], 255))
 
+def min_alpha(im):
+    """Smallest alpha value anywhere in a tile (255 for a None/absent face,
+    which reads as 'same as the side texture' -- see topbottom_for)."""
+    if im is None:
+        return 255
+    return im.getchannel("A").getextrema()[0]
+
 def tint(base_img, rgb):
     """Eased tint: keeps some of the base texture's own shading visible.
     Used for synthesised variants (stained clay/glass) where the base texture
@@ -224,6 +231,23 @@ def texture_for(bid):
     override -- see topbottom_for())."""
     base, data = split(bid)
 
+    if base == "SAND":
+        # data 1 = red sand (BlockSand.EnumType). Previously SAND fell through
+        # to DIRECT["SAND"] = sand.png for every data value, so red sand
+        # (SAND:1) rendered as ordinary yellow sand.
+        return load_tex("red_sand.png" if data == 1 else "sand.png") \
+               or solid((219, 207, 163))
+    if base == "RED_ROSE":
+        # BlockFlower.EnumFlowerType by data: 0 poppy, 1 blue orchid, 2 allium,
+        # 3 azure bluet, 4-7 tulips (red/orange/white/pink), 8 oxeye daisy.
+        # Was hardcoded to flower_rose.png (poppy) for every variant.
+        fl = {0: "flower_rose.png", 1: "flower_blue_orchid.png",
+              2: "flower_allium.png", 3: "flower_houstonia.png",
+              4: "flower_tulip_red.png", 5: "flower_tulip_orange.png",
+              6: "flower_tulip_white.png", 7: "flower_tulip_pink.png",
+              8: "flower_oxeye_daisy.png"}
+        return load_tex(fl.get(data, "flower_rose.png")) or solid((200, 60, 60))
+
     if base in ("WOOL", "CARPET"):
         f = "wool_colored_%s.png" % WOOL_NAME.get(data, "white")
         im = load_tex(f)
@@ -337,7 +361,8 @@ def texture_for(bid):
 SHAPE_IDS = {
     "CUBE": 0, "SLAB": 1, "STAIR": 2, "FENCE": 3, "FENCE_GATE": 4,
     "WALL": 5, "PANE": 6, "ANVIL": 7, "ENCHANT_TABLE": 8, "TRAPDOOR": 9,
-    "DOOR": 10,
+    "DOOR": 10, "CROSS": 11, "TORCH": 12, "LADDER": 13, "VINE": 14,
+    "PLATE": 15, "CHEST": 16, "SKULL": 17,
 }
 
 def shape_for(bid):
@@ -391,6 +416,33 @@ def shape_for(bid):
     if base in ("WOODEN_DOOR", "JUNGLE_DOOR"):
         return "DOOR", data
 
+    # Air-passable decorations rendered as their vanilla non-cube models (see
+    # block_shapes.c). CROSS = diagonal crossed planes (flowers, tall grass,
+    # ferns, dead bush, saplings, small mushrooms, and each half of a double
+    # plant); all pass 0 for param (no per-id data affects the shape). Their
+    # collision is empty -- BlockShape_Boxes returns 0 boxes, so the player
+    # walks through, matching vanilla.
+    if base in ("YELLOW_FLOWER", "RED_ROSE", "LONG_GRASS", "DEAD_BUSH",
+                "DOUBLE_PLANT", "BROWN_MUSHROOM", "RED_MUSHROOM", "SAPLING"):
+        return "CROSS", 0
+
+    # TORCH param = raw meta (BlockTorch.getStateFromMeta: 1=E 2=W 3=S 4=N
+    # facing, 5=standing). LADDER param = facing meta (2=N 3=S 4=W 5=E,
+    # EnumFacing.getFront). VINE param = attach bitmask (1=S 2=W 4=N 8=E).
+    # SKULL param = meta (bits0-2 = EnumFacing.getFront: 1=floor, 2..5 = wall).
+    if base == "TORCH":
+        return "TORCH", data
+    if base == "LADDER":
+        return "LADDER", data
+    if base == "VINE":
+        return "VINE", data
+    if base.endswith("PLATE"):          # STONE_PLATE, WOOD_PLATE, ...
+        return "PLATE", 0
+    if base.endswith("CHEST"):          # CHEST, TRAPPED_CHEST, ENDER_CHEST
+        return "CHEST", data
+    if base == "SKULL":
+        return "SKULL", data
+
     return "CUBE", 0
 
 def topbottom_for(bid):
@@ -443,18 +495,98 @@ def topbottom_for(bid):
         return top, None
     return None, None
 
-def load_book_tile():
-    """Crop a representative 16x16 tile from the enchanting table's floating
-    book texture (entity sheet, not a blocks/*.png -- ModelBook's cover/spine
-    boxes live in its top-left corner) for the static book box rendered above
-    the table (see block_shapes.c's mesh_enchant_table -- no animation, per
-    the task, so one flat tile stands in for the full multi-box page model)."""
+def load_book_tiles():
+    """Two 16x16 tiles for the static closed floating book rendered above the
+    enchanting table (block_shapes.c's mesh_enchant_table): the leather cover
+    (its two flat faces) and the white page edges (its four sides). Cropped
+    from the entity book sheet (not a blocks/*.png) using ModelBook's texture
+    layout -- cover face at uv [0,0..6,10], a page at uv [24,10..29,18] -- then
+    stretched to fill a full tile (the source regions are near-uniform, so the
+    NEAREST upscale just keeps the pixel-art look). No animation/tilt: this
+    engine has no rotation, so a flat closed book stands in for vanilla's
+    open, bobbing multi-box page model."""
     for base in (os.path.join(PACK, "assets", "minecraft", "textures", "entity"),
                  os.path.join(FALLBACK, "..", "entity")):
         path = os.path.join(base, "enchanting_table_book.png")
         if os.path.exists(path):
-            return Image.open(path).convert("RGBA").crop((0, 0, TILE, TILE))
-    return solid((139, 106, 65))
+            im = Image.open(path).convert("RGBA")
+            cover = im.crop((0, 0, 6, 10)).resize((TILE, TILE), Image.NEAREST)
+            pages = im.crop((24, 10, 29, 18)).resize((TILE, TILE), Image.NEAREST)
+            return cover, pages
+    return solid((139, 106, 65)), solid((222, 216, 198))
+
+def load_steve_tiles():
+    """Three 16x16 tiles for the default Steve head used on every skull
+    (block_shapes.c's mesh_skull -- skulls are TESRs with no block model, and
+    per the task all default to Steve). Cropped from the 64x64 player skin's
+    head faces: front (8,8..16,16) for the four sides, top (8,0..16,8) and
+    bottom (16,0..24,8) for +Y/-Y, each an 8x8 region scaled up to a full tile
+    (NEAREST keeps the pixel-art look)."""
+    for base in (os.path.join(PACK, "assets", "minecraft", "textures", "entity"),
+                 os.path.join(FALLBACK, "..", "entity")):
+        path = os.path.join(base, "steve.png")
+        if os.path.exists(path):
+            im = Image.open(path).convert("RGBA")
+            front = im.crop((8, 8, 16, 16)).resize((TILE, TILE), Image.NEAREST)
+            top = im.crop((8, 0, 16, 8)).resize((TILE, TILE), Image.NEAREST)
+            bottom = im.crop((16, 0, 24, 8)).resize((TILE, TILE), Image.NEAREST)
+            return front, top, bottom
+    fallback = solid((198, 134, 66))    # skin tone, if no skin file is found
+    return fallback, fallback, fallback
+
+# Held/dropped ITEMS (as opposed to placeable blocks). Each gets one appended
+# atlas tile whose index doubles as its inventory ItemStack.item id -- being
+# >= NUM_BLOCK_IDS is exactly how helditem.c/hud.c tell "flat item" from
+# "block". Emitted as ITEM_<NAME>_TILE in block_book_gen.h; source/items.h
+# gives the tools their dig properties and block_props_gen.h references the
+# rest as block drops (coal from coal ore, clay balls from clay, ...).
+# (name, textures/items/<file>, fallback solid colour)
+ITEM_TEXTURES = [
+    ("DIAMOND_SWORD",   "diamond_sword.png",    (90, 210, 220)),
+    ("DIAMOND_PICKAXE", "diamond_pickaxe.png",  (90, 210, 220)),
+    ("DIAMOND_AXE",     "diamond_axe.png",      (90, 210, 220)),
+    ("DIAMOND_SHOVEL",  "diamond_shovel.png",   (90, 210, 220)),
+    ("COAL",            "coal.png",             (30, 30, 30)),
+    ("DIAMOND",         "diamond.png",          (90, 210, 220)),
+    ("REDSTONE",        "redstone_dust.png",    (200, 30, 30)),
+    ("QUARTZ",          "quartz.png",           (230, 225, 215)),
+    ("FLINT",           "flint.png",            (60, 55, 55)),
+    ("CLAY_BALL",       "clay_ball.png",        (160, 165, 180)),
+    ("STRING",          "string.png",           (230, 230, 230)),
+    ("SNOWBALL",        "snowball.png",         (240, 250, 255)),
+    ("WHEAT",           "wheat.png",            (215, 190, 80)),
+    ("WHEAT_SEEDS",     "seeds_wheat.png",      (140, 170, 70)),
+    ("BOOK",            "book_normal.png",      (170, 130, 90)),
+    ("SIGN",            "sign.png",             (160, 130, 80)),
+    ("DOOR_WOOD",       "door_wood.png",        (150, 120, 70)),
+    ("BED",             "bed.png",              (190, 60, 60)),
+    ("COCOA_BEANS",     "dye_powder_brown.png", (120, 70, 40)),
+    ("NETHER_WART",     "nether_wart.png",      (150, 30, 40)),
+]
+
+# Block-breaking crack overlay (destroy_stage_0..9), drawn over the block the
+# player is currently mining -- see interact.c / World_DrawBreakOverlay. These
+# are blocks/*.png, not items/*.png, and are appended as one contiguous run so
+# the client can index them as DESTROY_STAGE_TILE + stage.
+DESTROY_STAGES = 10
+
+def load_item_tex(fname):
+    """Load a textures/items/*.png (RKYfault first, vanilla 1.8.9 fallback),
+    cropped/resized to a 16x16 RGBA tile. Items live under items/, not blocks/,
+    so this is separate from load_tex(). Used for the handful of held ITEMS
+    (as opposed to placeable blocks) this engine needs -- e.g. the diamond
+    sword; see helditem.c."""
+    for base in (os.path.join(PACK, "assets", "minecraft", "textures", "items"),
+                 os.path.join(FALLBACK, "..", "items")):
+        path = os.path.join(base, fname)
+        if os.path.exists(path):
+            im = Image.open(path).convert("RGBA")
+            if im.width != im.height:                   # animation strip -> frame 0
+                im = im.crop((0, 0, im.width, im.width))
+            if im.size != (TILE, TILE):
+                im = im.resize((TILE, TILE), Image.NEAREST)
+            return im
+    return None
 
 def main():
     ids_path = sys.argv[1] if len(sys.argv) > 1 else \
@@ -469,6 +601,7 @@ def main():
     tiles = [None] * len(ids)          # tile index -> image; grows past len(ids)
     top_override = [0] * len(ids)      # global id -> tile index (self if none)
     bot_override = [0] * len(ids)
+    opaque = [0] * len(ids)            # global id -> 1 if a full occluder cube
 
     for i, bid in enumerate(ids):
         side = texture_for(bid)
@@ -484,8 +617,53 @@ def main():
             bot_override[i] = len(tiles)
             tiles.append(bot)
 
-    book_tile = len(tiles)
-    tiles.append(load_book_tile())
+        # Face-culling occluder test: a full cube's shared face may be culled
+        # against this block only if it is *itself* a full cube whose every
+        # rendered face fully passes the world shader's alpha test (GEQUAL 128).
+        # A see-through cube (glass centre, gaps between leaves) leaves holes the
+        # alpha test discards, so culling behind it would show the deleted face
+        # -- you'd look straight through the terrain into the void. Non-cube
+        # shapes never reliably cover the voxel boundary, so they never occlude.
+        # Consumed as g_blockOpaque[] by world.c's occ_opaque().
+        name, _param = shape_for(bid)
+        face_min = min(min_alpha(side), min_alpha(top), min_alpha(bot))
+        opaque[i] = 1 if (name == "CUBE" and face_min >= 128) else 0
+
+    book_cover, book_pages = load_book_tiles()
+    book_cover_tile = len(tiles)
+    tiles.append(book_cover)
+    book_pages_tile = len(tiles)
+    tiles.append(book_pages)
+
+    # The anvil's working-surface texture (#top in vanilla anvil.json), used
+    # only on the up-face of the anvil's top box (block_shapes.c mesh_anvil);
+    # every other anvil face uses anvil_base (#body). Undamaged variant only --
+    # this engine doesn't track the per-anvil damage level.
+    anvil_top_tile = len(tiles)
+    tiles.append(load_tex("anvil_top_damaged_0.png") or solid((67, 67, 71)))
+
+    # Default Steve head tiles for skulls (block_shapes.c mesh_skull): side
+    # (front face) on the 4 walls, top and bottom for +Y/-Y.
+    steve_side, steve_top, steve_bottom = load_steve_tiles()
+    skull_side_tile = len(tiles);   tiles.append(steve_side)
+    skull_top_tile = len(tiles);    tiles.append(steve_top)
+    skull_bottom_tile = len(tiles); tiles.append(steve_bottom)
+
+    # Held/dropped ITEMS -- not placeable blocks, so they have no global block
+    # id. Each one's atlas tile index (appended past every block tile) doubles
+    # as the inventory ItemStack.item id: being >= NUM_BLOCK_IDS is exactly how
+    # helditem.c tells "flat item" from "block", while hud.c's tile_icon() draws
+    # it straight from that index like any other slot icon. See ITEM_TEXTURES.
+    item_tiles = {}
+    for name, fname, fallback_rgb in ITEM_TEXTURES:
+        item_tiles[name] = len(tiles)
+        tiles.append(load_item_tex(fname) or solid(fallback_rgb))
+
+    # Block-breaking crack overlay, one tile per destroy stage, contiguous.
+    destroy_stage_tile = len(tiles)
+    for i in range(DESTROY_STAGES):
+        tiles.append(load_tex(f"destroy_stage_{i}.png") or
+                     Image.new("RGBA", (TILE, TILE), (0, 0, 0, 0)))
 
     n_tiles = len(tiles)
     rows = (n_tiles + ATLAS_COLS - 1) // ATLAS_COLS
@@ -510,7 +688,9 @@ def main():
 
     write_face_table(ids, top_override, bot_override)
     write_atlas_geometry(atlas_w, atlas_h)
-    write_shape_table(ids, book_tile)
+    write_shape_table(ids, opaque, book_cover_tile, book_pages_tile, anvil_top_tile,
+                      skull_side_tile, skull_top_tile, skull_bottom_tile,
+                      item_tiles, destroy_stage_tile, n_tiles)
 
 def write_face_table(ids, top_override, bot_override):
     src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "source"))
@@ -533,10 +713,13 @@ def write_face_table(ids, top_override, bot_override):
         f.write("#endif\n")
     print(f"  wrote {hpath} ({n_overridden} ids with a top/bottom override)")
 
-def write_shape_table(ids, book_tile):
+def write_shape_table(ids, opaque, book_cover_tile, book_pages_tile, anvil_top_tile,
+                      skull_side_tile, skull_top_tile, skull_bottom_tile,
+                      item_tiles, destroy_stage_tile, n_tiles):
     """Emit the per-global-id non-cube shape table (source/block_shapes_gen.h)
     that world.c's mesher and World_BlockBoxes() collision query both consult
-    to dispatch away from the default full-cube path. See shape_for()."""
+    to dispatch away from the default full-cube path. See shape_for(). Also
+    emits g_blockOpaque[] (the face-culling occluder flag, see the main loop)."""
     src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "source"))
     hpath = os.path.join(src_dir, "block_shapes_gen.h")
     shapes = []
@@ -557,9 +740,20 @@ def write_shape_table(ids, book_tile):
         f.write(f"static const u8 g_blockParam[{len(ids)}] = {{\n")
         f.write(",".join(str(v) for v in params))
         f.write("\n};\n\n")
+        f.write("/* 1 iff this id is a full cube that fully occludes: every rendered\n")
+        f.write(" * face texture passes the world alpha test, so an adjacent cube's\n")
+        f.write(" * shared face may be culled against it. 0 for non-cube shapes and\n")
+        f.write(" * for see-through cubes (glass, leaves) -- culling behind those\n")
+        f.write(" * would show the deleted face through their gaps. See occ_opaque()\n")
+        f.write(" * in world.c and the opacity test in this tool's main loop. */\n")
+        f.write(f"static const u8 g_blockOpaque[{len(ids)}] = {{\n")
+        f.write(",".join(str(v) for v in opaque))
+        f.write("\n};\n\n")
         f.write("#endif\n")
     n_special = sum(1 for s in shapes if s != 0)
-    print(f"  wrote {hpath} ({n_special} non-cube ids)")
+    n_transp = sum(1 for i, s in enumerate(shapes) if s == 0 and not opaque[i])
+    print(f"  wrote {hpath} ({n_special} non-cube ids, "
+          f"{n_transp} see-through cubes)")
 
     # Separate tiny header (not block_shapes_gen.h) so block_shapes.c -- which
     # needs this constant but not the (world.c-only) per-id shape tables above
@@ -569,9 +763,34 @@ def write_shape_table(ids, book_tile):
     with open(bpath, "w", encoding="utf-8") as f:
         f.write("/* Generated by tools/build_atlas.py -- do not edit. */\n")
         f.write("#ifndef MSW_BLOCK_BOOK_GEN_H\n#define MSW_BLOCK_BOOK_GEN_H\n\n")
-        f.write("/* Atlas tile for the enchanting table's static floating book\n")
-        f.write(" * (mesh_enchant_table in block_shapes.c). */\n")
-        f.write(f"#define ENCHANT_BOOK_TILE {book_tile}\n\n")
+        f.write("/* Extra atlas tiles that block_shapes.c's mesh emitters need by\n")
+        f.write(" * index (not part of the per-global-id side/top/bottom tables). */\n\n")
+        f.write("/* Enchanting table's static floating book (mesh_enchant_table):\n")
+        f.write(" * leather cover on its two flat faces, page edges on its sides. */\n")
+        f.write(f"#define ENCHANT_BOOK_COVER_TILE {book_cover_tile}\n")
+        f.write(f"#define ENCHANT_BOOK_PAGES_TILE {book_pages_tile}\n\n")
+        f.write("/* Anvil working-surface texture for the top box's up-face only\n")
+        f.write(" * (mesh_anvil); all other anvil faces use anvil_base. */\n")
+        f.write(f"#define ANVIL_TOP_TILE {anvil_top_tile}\n\n")
+        f.write("/* Default Steve head tiles for skulls (mesh_skull): front face\n")
+        f.write(" * on the 4 sides, plus the head's top and bottom. */\n")
+        f.write(f"#define SKULL_SIDE_TILE {skull_side_tile}\n")
+        f.write(f"#define SKULL_TOP_TILE {skull_top_tile}\n")
+        f.write(f"#define SKULL_BOTTOM_TILE {skull_bottom_tile}\n\n")
+        f.write("/* Held/dropped ITEMS (not placeable blocks): the atlas tile\n")
+        f.write(" * index is used directly as the inventory ItemStack.item id.\n")
+        f.write(" * Being >= NUM_BLOCK_IDS is how helditem.c distinguishes a\n")
+        f.write(" * flat item from a block. See source/items.h for the tools'\n")
+        f.write(" * dig properties and block_props_gen.h for the drop tables. */\n")
+        for name, _fname, _rgb in ITEM_TEXTURES:
+            f.write(f"#define ITEM_{name}_TILE {item_tiles[name]}\n")
+        f.write("\n/* Block-breaking crack overlay: DESTROY_STAGE_TILE + stage,\n")
+        f.write(" * stage in 0..DESTROY_STAGE_COUNT-1 (vanilla destroy_stage_N). */\n")
+        f.write(f"#define DESTROY_STAGE_TILE {destroy_stage_tile}\n")
+        f.write(f"#define DESTROY_STAGE_COUNT {DESTROY_STAGES}\n\n")
+        f.write("/* Total tiles packed into the atlas (block tiles + face\n")
+        f.write(" * overrides + the extras above); an id/tile past this is a bug. */\n")
+        f.write(f"#define NUM_ATLAS_TILES {n_tiles}\n\n")
         f.write("#endif\n")
     print(f"  wrote {bpath}")
 
