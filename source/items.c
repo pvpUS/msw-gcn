@@ -67,6 +67,12 @@ int Item_CanHarvestBlock(int item, int blockId) {
 	return d->tier >= b->harvestLevel;
 }
 
+int Block_IsLiquid(int blockId) {
+	if (blockId < 0 || blockId >= NUM_BLOCK_IDS) return 0;
+	u8 m = g_blockProps[blockId].material;
+	return m == MAT_WATER || m == MAT_LAVA;
+}
+
 int Block_CanHarvest(int blockId, int heldItem) {
 	if (blockId < 0 || blockId >= NUM_BLOCK_IDS) return 0;
 	/* InventoryPlayer.canHeldItemHarvest: material.isToolNotRequired() short-

@@ -385,7 +385,14 @@ def main():
     out_dir = os.path.abspath(out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
-    ids_path = os.path.join(src_dir, "_blockids.txt")
+    # The palette is vendored in the repo (data/blockids.txt) so a rebuild is
+    # reproducible without the scan directory, and so the extra ids appended
+    # past the scans' union -- lava, TNT, WATER:0/:8, the sentinel -- are in
+    # scope here too. The scan dir's own _blockids.txt is only the union of
+    # what the 31 maps contained; falling back to it would renumber every map.
+    ids_path = sys.argv[3] if len(sys.argv) > 3 else \
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data",
+                                     "blockids.txt"))
     global_ids, id_to_global = load_global_ids(ids_path)
     print(f"global palette: {len(global_ids)} block ids")
 

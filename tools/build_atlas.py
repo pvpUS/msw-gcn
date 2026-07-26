@@ -195,6 +195,8 @@ DIRECT = {
     "HUGE_MUSHROOM_2":"mushroom_block_skin_red.png",
     "TORCH":"torch_on.png", "FIRE":"lava_still.png",
     "WATER":"water_still.png", "STATIONARY_WATER":"water_still.png",
+    "LAVA":"lava_still.png", "STATIONARY_LAVA":"lava_still.png",
+    "TNT":"tnt_side.png",
     "IRON_FENCE":"iron_bars.png", "IRON_TRAPDOOR":"iron_trapdoor.png",
     "TRAP_DOOR":"trapdoor.png", "ANVIL":"anvil_base.png",
     "HOPPER":"hopper_outside.png", "DROPPER":"furnace_side.png",
@@ -225,11 +227,30 @@ DIRECT = {
     "RED_SANDSTONE_STAIRS":"red_sandstone_normal.png",
 }
 
+def checker(a, b, cell=4):
+    """Two-colour checkerboard, for the palette sentinel's placeholder tile."""
+    im = Image.new("RGBA", (TILE, TILE))
+    p = im.load()
+    for y in range(TILE):
+        for x in range(TILE):
+            c = a if ((x // cell) + (y // cell)) % 2 == 0 else b
+            p[x, y] = (c[0], c[1], c[2], 255)
+    return im
+
 def texture_for(bid):
     """returns a 16x16 RGBA Image for a full block id like 'WOOL:14'. This is
     the *side* face texture (and the only one, for ids with no top/bottom
     override -- see topbottom_for())."""
     base, data = split(bid)
+
+    # The palette sentinel (last line of data/blockids.txt): the id a 1.8 block
+    # state with no global id resolves to, and what World_SetBlock clamps an
+    # out-of-range id to. Deliberately the loudest thing on screen -- it only
+    # ever appears when the palette is wrong, and it is only ever *loaded* for
+    # offline diagnostics (the proxy drops unmapped states rather than sending
+    # this; see tools/gen_blockmap.py).
+    if base == "UNKNOWN_BLOCK":
+        return checker((255, 0, 220), (16, 16, 16))
 
     if base == "SAND":
         # data 1 = red sand (BlockSand.EnumType). Previously SAND fell through
@@ -478,6 +499,8 @@ def topbottom_for(bid):
     if base == "FURNACE":
         top = load_tex("furnace_top.png")
         return top, top
+    if base == "TNT":
+        return load_tex("tnt_top.png"), load_tex("tnt_bottom.png")
     if base == "HAY_BLOCK":
         top = load_tex("hay_block_top.png")
         return top, top
@@ -590,7 +613,7 @@ def load_item_tex(fname):
 
 def main():
     ids_path = sys.argv[1] if len(sys.argv) > 1 else \
-        r"C:\Users\awt12\Downloads\download (1)\BlockScans\_blockids.txt"
+        os.path.join(os.path.dirname(__file__), "..", "data", "blockids.txt")
     out_dir = sys.argv[2] if len(sys.argv) > 2 else \
         os.path.join(os.path.dirname(__file__), "..", "data")
     out_dir = os.path.abspath(out_dir)

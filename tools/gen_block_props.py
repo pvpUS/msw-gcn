@@ -47,11 +47,11 @@ import os, sys
 MATERIALS = ["AIR", "ROCK", "IRON", "ANVIL", "WOOD", "PLANTS", "VINE", "LEAVES",
              "GOURD", "GROUND", "GRASS", "SAND", "CLAY", "SNOW", "CRAFTED_SNOW",
              "CLOTH", "CARPET", "GLASS", "ICE", "WEB", "CIRCUITS", "WATER",
-             "FIRE", "PISTON", "CAKE"]
+             "FIRE", "PISTON", "CAKE", "LAVA"]
 
 # Material.setReplaceable(): a block placement may overwrite these outright
 # instead of offsetting to the clicked side (World.canBlockBePlaced).
-REPLACEABLE = {"AIR", "WATER", "FIRE", "VINE", "SNOW"}
+REPLACEABLE = {"AIR", "WATER", "LAVA", "FIRE", "VINE", "SNOW"}
 
 # Which tool class gets its efficiency bonus on this material
 # (ItemPickaxe/ItemAxe.getStrVsBlock's material test; ItemSpade goes through
@@ -179,6 +179,14 @@ fam("SKULL",                      1.0,  "CIRCUITS")
 fam("BED_BLOCK",                  0.2,  "WOOD", TOOL_AXE)
 fam("FIRE",                       0.0,  "FIRE")
 fam("WATER STATIONARY_WATER",   100.0,  "WATER")
+fam("LAVA STATIONARY_LAVA",     100.0,  "LAVA")
+# BlockTNT: setHardness(0), Material.tnt -- no tool speeds it up and none is
+# required, and at hardness 0 it breaks in one tick regardless, so CLOTH (the
+# nearest no-tool material this enum has) is behaviourally exact here.
+fam("TNT",                        0.0,  "CLOTH")
+# The palette sentinel (see tools/gen_blockmap.py). Unbreakable and drops
+# nothing so a placeholder can never turn into a real item.
+fam("UNKNOWN_BLOCK",             -1.0,  "ROCK", TOOL_PICKAXE)
 
 # ---- drops -----------------------------------------------------------------
 # family -> (dropSpec, minCount, maxCount, oneInN, altSpec)
@@ -226,7 +234,10 @@ DROPS = {
     "FIRE": (None, 0, 0, 1, None),
     "WATER": (None, 0, 0, 1, None),
     "STATIONARY_WATER": (None, 0, 0, 1, None),
+    "LAVA": (None, 0, 0, 1, None),
+    "STATIONARY_LAVA": (None, 0, 0, 1, None),
     "BEDROCK": (None, 0, 0, 1, None),
+    "UNKNOWN_BLOCK": (None, 0, 0, 1, None),
 }
 # double slabs drop two of the matching single slab
 DOUBLE_SLAB = {"DOUBLE_STEP": "STEP", "WOOD_DOUBLE_STEP": "WOOD_STEP"}
@@ -241,7 +252,8 @@ def split(bid):
 
 def main():
     ids_path = sys.argv[1] if len(sys.argv) > 1 else \
-        r"C:\Users\awt12\Downloads\download (1)\BlockScans\_blockids.txt"
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data",
+                                     "blockids.txt"))
     src_dir = sys.argv[2] if len(sys.argv) > 2 else \
         os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "source"))
 

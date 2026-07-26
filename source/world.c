@@ -14,6 +14,19 @@
 #include "block_shapes_gen.h" /* generated: g_blockShape[], g_blockParam[] */
 #include "block_book_gen.h"   /* generated: DESTROY_STAGE_TILE */
 #include "block_props_gen.h"  /* generated: g_blockProps[] (material, for liquids) */
+#include "blockmap_gen.h"     /* generated: BLOCKMAP_SENTINEL_ID */
+
+/* Every per-id table this file indexes -- g_blockShape[], g_blockParam[],
+ * g_topTile[], g_bottomTile[], g_blockOpaque[], g_blockProps[] -- is exactly
+ * NUM_BLOCK_IDS long and is read on the mesh/collision hot paths with no
+ * bounds test of its own. So an id is validated once, here, at the only two
+ * places one can enter the world: the .mworld decoder and World_SetBlock (the
+ * network path). Out of range becomes the palette sentinel, which renders as
+ * a magenta/black checker -- visible and inert, rather than whatever lies past
+ * the end of those arrays. */
+static inline u16 clamp_block_id(int id) {
+	return (id >= 0 && id < NUM_BLOCK_IDS) ? (u16)id : (u16)BLOCKMAP_SENTINEL_ID;
+}
 
 /* Texcoords are GX_U16 with 10 fractional bits, so a stored value V maps to
  * V/1024 of the texture's width/height. `atlasPixel` is an exact texel edge in
@@ -698,6 +711,7 @@ int World_SetBlock(World *w, int bx, int by, int bz, int id) {
 	int gx, gy, gz;
 	if (!w->colStart || !w->meshPad) return 0;
 	if (!to_grid(w, bx, by, bz, &gx, &gy, &gz)) return 0;
+	if (id >= 0) id = clamp_block_id(id);   /* -1 stays air */
 	if (World_GetBlock(w, bx, by, bz) == id) return 0;
 
 	if (!edit_put(w, vox_index(w, gx, gy, gz), id)) return 0;
@@ -829,7 +843,7 @@ static void cb_store(void *ctx, int x, int y, int z, int li) {
 	if (c != lc->lastCol) { lc->lastCol = c; lc->k = 0; }
 	u32 i = w->colStart[c] + lc->k++;
 	w->voxY[i] = (u8)(y + WORLD_MARGIN_Y);
-	w->voxId[i] = rd_u16(lc->palette + li * 2);
+	w->voxId[i] = clamp_block_id((int)rd_u16(lc->palette + li * 2));
 }
 
 int World_Load(World *w, const u8 *blob, u32 blobLen) {

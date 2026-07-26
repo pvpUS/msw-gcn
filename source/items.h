@@ -51,6 +51,15 @@ int Item_CanHarvestBlock(int item, int blockId);
 
 /* ---- the block side of the same question -------------------------------- */
 
+/* Material.isLiquid(): true for water and lava, in any metadata state.
+ *
+ * Vanilla's liquids are *not* solid -- they have no collision box, they don't
+ * occlude, and an entity inside one takes a different branch of
+ * moveEntityWithHeading (swim/lava drag) instead of the ground/air one. A
+ * block id outside the palette is not a liquid, so this is safe to call with
+ * an unvalidated id. */
+int Block_IsLiquid(int blockId);
+
 /* EntityPlayer.canHarvestBlock -> InventoryPlayer.canHeldItemHarvest:
  * true when the block needs no tool, or the held item can harvest it. */
 int Block_CanHarvest(int blockId, int heldItem);

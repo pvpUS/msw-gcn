@@ -8,3 +8,8 @@ build/
 
 # reference clone of devkitPro/gamecube-examples, not part of this project
 .gc-examples/
+
+# gxtexconv intermediates: build_atlas.py writes atlas.png, gxtexconv turns it
+# into the committed atlas.tpl and drops an unused atlas.h beside it
+data/atlas.png
+data/atlas.h

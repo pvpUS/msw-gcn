@@ -60,7 +60,11 @@ CFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
 CPPFILES	:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
 sFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
 SFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.S)))
-BINFILES	:=	$(foreach dir,$(DATA),$(notdir $(wildcard $(dir)/*.*)))
+# Only the two extensions with a bin2o rule below. Deliberately not *.* --
+# data/ also holds the build inputs the asset tools read and write
+# (blockids.txt, materials.txt, and gxtexconv's intermediate atlas.png/atlas.h),
+# and a wildcard over all of them asks make for a nonexistent <file>.o rule.
+BINFILES	:=	$(foreach dir,$(DATA),$(notdir $(wildcard $(dir)/*.mworld) $(wildcard $(dir)/*.tpl)))
 
 #---------------------------------------------------------------------------------
 # use CXX for linking C++ projects, CC for standard C
