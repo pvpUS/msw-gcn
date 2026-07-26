@@ -1,22 +1,16 @@
 #include <math.h>
+#include <stdlib.h>
 #include <gccore.h>
 
 #include "player.h"
 #include "camera.h"
 #include "world.h"
-
-/* ---- input tuning (controller, not gameplay physics) ------------------ */
-#define DEG2RAD        0.017453292519943295f
-#define STICK_DEADZONE 12        /* C-stick look deadzone (raw units)       */
-#define MOVE_DEADZONE  30        /* main-stick push past this = full +/-1    */
-#define LOOK_SPEED     2.2f      /* degrees per frame at full C-stick tilt  */
-#define PITCH_LIMIT    89.0f
-#define SPRINT_TRIGGER 100       /* analog R threshold to count as sprint   */
+#include "items.h"
+#include "block_props_gen.h"   /* g_blockProps[].material / .data */
 
 /* ---- Minecraft 1.8.9 physics constants (block units, per 20 Hz tick) --- */
-#define PLAYER_WIDTH        0.6
-#define PLAYER_HEIGHT       1.8
-#define PLAYER_EYE_HEIGHT   1.62
+#define DEG2RAD             0.017453292519943295f
+#define PITCH_LIMIT         89.0f
 #define STEP_HEIGHT         0.6
 #define GRAVITY             0.08                 /* motionY -= 0.08          */
 #define AIR_DRAG_Y          0.9800000190734863   /* motionY *= 0.98          */
@@ -28,6 +22,17 @@
 #define JUMP_UPWARDS_MOTION 0.41999998688697815  /* getJumpUpwardsMotion()   */
 #define JUMP_COOLDOWN_TICKS 10
 
+/* moveEntityWithHeading's liquid branches. Water drags to 0.8 of the previous
+ * tick's speed (0.9 while sprinting -- swimming forward is faster), lava to
+ * half, and both accelerate at a flat 0.02 regardless of what is underfoot. */
+#define WATER_ACCEL         0.02
+#define WATER_DRAG          0.800000011920929
+#define WATER_SPRINT_DRAG   0.9
+#define LAVA_DRAG           0.5
+#define LIQUID_SINK         0.02                 /* motionY -= 0.02          */
+#define LIQUID_JUMP         0.03999999910593033  /* jump held while in one   */
+#define LIQUID_LEDGE_BUMP   0.30000001192092896  /* climb out onto a ledge   */
+
 /* EntityLivingBase.maxHurtResistantTime: ticks of invulnerability after a hit
  * (the damage test uses half of this). */
 #define MAX_HURT_RESISTANT_TIME 20
@@ -35,6 +40,21 @@
 /* moveFlying's magic constant is exactly (0.6*0.91)^3, so on default ground
  * the acceleration factor 0.16277136/f4^3 reduces to 1.0. */
 #define MOVE_FLYING_CONST   0.16277136
+
+/* EntityPlayer.onLivingUpdate: eating, drinking or drawing a bow cuts movement
+ * input to a fifth. Without it the console's position stream diverges from the
+ * server's for the whole 32 ticks of every golden apple. */
+#define ITEM_USE_SLOWDOWN   0.2f
+
+/* EntityRenderer.hurtCameraEffect: the roll, in degrees, at the peak of the
+ * flinch. In 1.8 this tilt is the *entire* local damage feedback -- there is no
+ * red screen tint on the player's own view. */
+#define HURT_TILT_DEGREES   14.0f
+
+/* Spectator flight, blocks per tick. NetHandlerPlayServer kicks on a single
+ * tick's dist^2 over 100, i.e. 10 blocks; this is a twentieth of that, which
+ * is still 10 blocks a second and comfortably faster than walking. */
+#define SPECTATOR_SPEED     0.5
 
 /* ---- axis-aligned bounding box ---------------------------------------- */
 typedef struct { double minX, minY, minZ, maxX, maxY, maxZ; } AABB;
@@ -50,6 +70,15 @@ static AABB bb_offset(AABB b, double dx, double dy, double dz) {
 	b.minX += dx; b.maxX += dx;
 	b.minY += dy; b.maxY += dy;
 	b.minZ += dz; b.maxZ += dz;
+	return b;
+}
+
+/* AxisAlignedBB.expand: negative arguments shrink, which is how both fluid
+ * tests are written in vanilla. */
+static AABB bb_expand(AABB b, double dx, double dy, double dz) {
+	b.minX -= dx; b.maxX += dx;
+	b.minY -= dy; b.maxY += dy;
+	b.minZ -= dz; b.maxZ += dz;
 	return b;
 }
 
@@ -95,7 +124,9 @@ static double calcZOffset(double x0, double y0, double z0,
 }
 
 /* World.getCollidingBoundingBoxes(...).isEmpty(): 1 if no block's collision
- * box intersects `b`. Used by the sneak ledge guard. */
+ * box intersects `b`. Used by the sneak ledge guard and the swim-out test.
+ * Liquids have no collision box at all (World_BlockBoxes returns none), so
+ * this is already liquid-transparent. */
 static int no_collision(const World *w, AABB b) {
 	int x0 = ifloor(b.minX), x1 = ifloor(b.maxX);
 	int y0 = ifloor(b.minY), y1 = ifloor(b.maxY);
@@ -118,6 +149,99 @@ static int no_collision(const World *w, AABB b) {
 				}
 			}
 	return 1;
+}
+
+/* ---- fluids (T21) ------------------------------------------------------
+ * The engine's water and lava are full opaque-looking cubes on screen and
+ * nothing at all to the collision code: World_BlockBoxes returns no boxes for
+ * them. Being *inside* one is therefore not a collision question but a
+ * containment one, and these three functions are World.isMaterialInBB,
+ * World.handleMaterialAcceleration's containment half, and World.isAnyLiquid.
+ *
+ * Getting this right is the cheapest kick prevention in the plan. A player who
+ * stands on a water surface is, from the server's point of view, hovering in
+ * mid-air, and eighty ticks of that is "Flying is not enabled on this
+ * server". */
+
+/* BlockLiquid.getLiquidHeightPercent: a source or a falling column is full
+ * height; a flowing level 1-7 steps down in ninths. */
+static float liquid_height_pct(int level) {
+	if (level >= 8) level = 0;
+	return (float)(level + 1) / 9.0f;
+}
+
+/* World.isMaterialInBB: any block of `mat` overlapping the box at all. */
+static int material_in_bb(const World *w, AABB b, int mat) {
+	int x0 = ifloor(b.minX), x1 = ifloor(b.maxX + 1.0);
+	int y0 = ifloor(b.minY), y1 = ifloor(b.maxY + 1.0);
+	int z0 = ifloor(b.minZ), z1 = ifloor(b.maxZ + 1.0);
+	int bx, by, bz;
+	for (bx = x0; bx < x1; bx++)
+		for (by = y0; by < y1; by++)
+			for (bz = z0; bz < z1; bz++) {
+				int id = World_GetBlock(w, bx, by, bz);
+				if (id >= 0 && g_blockProps[id].material == mat) return 1;
+			}
+	return 0;
+}
+
+/* World.handleMaterialAcceleration, minus the flow-acceleration vector this
+ * engine does not model: is any block of `mat` in the box, *and* does the box
+ * reach the fluid's own surface height rather than merely its cell. */
+static int material_reaches_surface(const World *w, AABB b, int mat) {
+	int x0 = ifloor(b.minX), x1 = ifloor(b.maxX + 1.0);
+	int y0 = ifloor(b.minY), y1 = ifloor(b.maxY + 1.0);
+	int z0 = ifloor(b.minZ), z1 = ifloor(b.maxZ + 1.0);
+	int bx, by, bz;
+	for (bx = x0; bx < x1; bx++)
+		for (by = y0; by < y1; by++)
+			for (bz = z0; bz < z1; bz++) {
+				int id = World_GetBlock(w, bx, by, bz);
+				if (id < 0 || g_blockProps[id].material != mat) continue;
+				double surface = (double)(by + 1) -
+				                 (double)liquid_height_pct(g_blockProps[id].data);
+				if ((double)y1 >= surface) return 1;
+			}
+	return 0;
+}
+
+/* World.isAnyLiquid. */
+static int any_liquid(const World *w, AABB b) {
+	int x0 = ifloor(b.minX), x1 = ifloor(b.maxX + 1.0);
+	int y0 = ifloor(b.minY), y1 = ifloor(b.maxY + 1.0);
+	int z0 = ifloor(b.minZ), z1 = ifloor(b.maxZ + 1.0);
+	int bx, by, bz;
+	for (bx = x0; bx < x1; bx++)
+		for (by = y0; by < y1; by++)
+			for (bz = z0; bz < z1; bz++)
+				if (Block_IsLiquid(World_GetBlock(w, bx, by, bz))) return 1;
+	return 0;
+}
+
+/* Entity.handleWaterMovement / Entity.isInLava, with vanilla's exact shrinks:
+ * water wants the box lifted 0.4 off the feet so a puddle underfoot does not
+ * count, lava the same idea a little narrower. */
+static int in_water(const Player *p, const World *w) {
+	AABB b = player_bb(p);
+	b = bb_expand(b, 0.0, -0.4000000059604645, 0.0);
+	b = bb_expand(b, -0.001, -0.001, -0.001);
+	return material_reaches_surface(w, b, MAT_WATER);
+}
+
+static int in_lava(const Player *p, const World *w) {
+	AABB b = bb_expand(player_bb(p), -0.10000000149011612, -0.4000000059604645,
+	                   -0.10000000149011612);
+	return material_in_bb(w, b, MAT_LAVA);
+}
+
+/* Entity.isOffsetPositionInLiquid: could the box move there and still be in a
+ * liquid with nothing solid in the way. This is the ledge bump -- swimming
+ * into a wall with liquid at head height pushes you up and out of the water,
+ * which is what climbing out of a pool feels like. */
+static int offset_in_liquid(const Player *p, const World *w,
+                            double dx, double dy, double dz) {
+	AABB b = bb_offset(player_bb(p), dx, dy, dz);
+	return no_collision(w, b) && !any_liquid(w, b);
 }
 
 /* Integer block range covering an AABB, matching getCollidingBoundingBoxes.
@@ -310,9 +434,49 @@ static void player_jump(Player *p) {
 	}
 }
 
-/* EntityLivingBase.moveEntityWithHeading (ground/air branch only). */
+/* EntityLivingBase.moveEntityWithHeading. Three branches, in vanilla's order:
+ * water, lava, then the ground/air one everything else takes. The liquid
+ * branches ignore block friction and step-up entirely -- you do not walk in
+ * water, you swim through it. */
 static void moveWithHeading(Player *p, const World *w,
                             double strafe, double forward, int sneaking) {
+	if (p->inWater) {
+		double y0 = p->y;
+		double drag = p->sprinting ? WATER_SPRINT_DRAG : WATER_DRAG;
+
+		moveFlying(p, strafe, forward, WATER_ACCEL);
+		moveEntity(p, w, p->motionX, p->motionY, p->motionZ, sneaking);
+		p->motionX *= drag;
+		p->motionY *= WATER_DRAG;
+		p->motionZ *= drag;
+		p->motionY -= LIQUID_SINK;
+
+		if (p->isCollidedHorizontally &&
+		    offset_in_liquid(p, w, p->motionX,
+		                     p->motionY + 0.6000000238418579 - p->y + y0,
+		                     p->motionZ))
+			p->motionY = LIQUID_LEDGE_BUMP;
+		return;
+	}
+
+	if (p->inLava) {
+		double y0 = p->y;
+
+		moveFlying(p, strafe, forward, WATER_ACCEL);
+		moveEntity(p, w, p->motionX, p->motionY, p->motionZ, sneaking);
+		p->motionX *= LAVA_DRAG;
+		p->motionY *= LAVA_DRAG;
+		p->motionZ *= LAVA_DRAG;
+		p->motionY -= LIQUID_SINK;
+
+		if (p->isCollidedHorizontally &&
+		    offset_in_liquid(p, w, p->motionX,
+		                     p->motionY + 0.6000000238418579 - p->y + y0,
+		                     p->motionZ))
+			p->motionY = LIQUID_LEDGE_BUMP;
+		return;
+	}
+
 	/* friction of the block under the feet (default 0.6 -> 0.546 on ground) */
 	double f4 = p->onGround ? BASE_SLIPPERINESS * GROUND_FRICTION_BASE
 	                        : GROUND_FRICTION_BASE;
@@ -340,30 +504,75 @@ static void moveWithHeading(Player *p, const World *w,
 
 /* ---- health / fall damage (EntityLivingBase + Entity, 1.8.9) ----------- */
 
-void Player_Damage(Player *p, float amount) {
+void Player_Damage(Player *p, float amount, int source,
+                   double srcX, double srcZ) {
 	/* attackEntityFrom: dead entities and (here) the invulnerability window. */
 	if (p->health <= 0.0f) return;
 
+	int flinch;
 	if ((float)p->hurtResistantTime > (float)MAX_HURT_RESISTANT_TIME / 2.0f) {
-		/* still invulnerable: only the *extra* over the last hit lands */
+		/* still invulnerable: only the *extra* over the last hit lands, and it
+		 * does not restart the flinch -- that is why a fire tick during a fight
+		 * does not reset the ten-tick red flash. */
 		if (amount <= p->lastDamage) return;
 		p->health -= (amount - p->lastDamage);   /* damageEntity(amount-last) */
 		p->lastDamage = amount;
+		flinch = 0;
 	} else {
 		p->lastDamage = amount;
 		p->hurtResistantTime = MAX_HURT_RESISTANT_TIME;
 		p->health -= amount;                     /* damageEntity(amount) */
+		flinch = 1;
 	}
+
+	/* Where the hit came from, relative to the way the player is facing --
+	 * which is the axis the camera tilts about. A source with no position
+	 * (falling, the void) gets vanilla's coin flip rather than a fixed side.
+	 * Recorded on both branches, as vanilla does, so a follow-up hit from
+	 * behind still turns the tilt even while the first one is still decaying. */
+	double dx = srcX - p->x, dz = srcZ - p->z;
+	if (dx * dx + dz * dz < 1.0e-4)
+		p->pose.attackedAtYaw = (rand() & 1) ? 180.0f : 0.0f;
+	else
+		p->pose.attackedAtYaw =
+			Pose_WrapDegrees(Pose_YawOf(dx, dz, p->yaw) - p->yaw);
+
+	if (flinch) Pose_Hurt(&p->pose, p->pose.attackedAtYaw);
+	(void)source;
 
 	/* setHealth clamps to [0, maxHealth] */
 	if (p->health < 0.0f) p->health = 0.0f;
 	if (p->health > PLAYER_MAX_HEALTH) p->health = PLAYER_MAX_HEALTH;
 }
 
+void Player_SetVelocity(Player *p, double mx, double my, double mz) {
+	p->motionX = mx;
+	p->motionY = my;
+	p->motionZ = mz;
+	/* Knockback lifts you off the ground; leaving onGround set would let the
+	 * next tick's friction eat it before it moved anything. */
+	if (my > 0.0) p->onGround = 0;
+}
+
+void Player_Teleport(Player *p, double x, double y, double z,
+                     float yaw, float pitch) {
+	p->x = x; p->y = y; p->z = z;
+	p->prevX = x; p->prevY = y; p->prevZ = z;
+	p->motionX = p->motionY = p->motionZ = 0.0;
+	p->yaw = yaw;
+	p->pitch = pitch;
+	if (p->pitch >  PITCH_LIMIT) p->pitch =  PITCH_LIMIT;
+	if (p->pitch < -PITCH_LIMIT) p->pitch = -PITCH_LIMIT;
+	p->fallDistance = 0.0f;
+	p->onGround = 0;
+	p->isCollidedHorizontally = p->isCollidedVertically = 0;
+	Pose_Init(&p->pose, p->yaw, p->pitch);
+}
+
 /* EntityLivingBase.fall: distance over 3 blocks turns into half-heart damage. */
 static void player_fall(Player *p, float distance) {
 	int i = (int)ceil((double)distance - 3.0);   /* ceiling_float_int(distance-3) */
-	if (i > 0) Player_Damage(p, (float)i);
+	if (i > 0) Player_Damage(p, (float)i, DMG_FALL, p->x, p->z);
 }
 
 /* Entity.updateFallState: accumulate fall height while airborne, cash it in on
@@ -371,7 +580,7 @@ static void player_fall(Player *p, float distance) {
 static void updateFallState(Player *p, double dy) {
 	if (p->onGround) {
 		if (p->fallDistance > 0.0f) {
-			player_fall(p, p->fallDistance);
+			if (!p->serverDriven) player_fall(p, p->fallDistance);
 			p->fallDistance = 0.0f;
 		}
 	} else if (dy < 0.0) {
@@ -390,12 +599,7 @@ static void player_respawn(Player *p) {
 	p->lastDamage = 0.0f;
 }
 
-/* ---- input ------------------------------------------------------------ */
-static float deadzone(int raw) {
-	if (raw >  STICK_DEADZONE) return (float)(raw - STICK_DEADZONE) / (127 - STICK_DEADZONE);
-	if (raw < -STICK_DEADZONE) return (float)(raw + STICK_DEADZONE) / (127 - STICK_DEADZONE);
-	return 0.0f;
-}
+/* ---- public ------------------------------------------------------------ */
 
 void Player_Spawn(Player *p, const World *w) {
 	p->x = w->spawnx;
@@ -410,23 +614,30 @@ void Player_Spawn(Player *p, const World *w) {
 	p->isCollidedVertically = 0;
 	p->jumpTicks = 0;
 	p->sprinting = 0;
+	p->sneaking = 0;
+	p->inWater = p->inLava = 0;
 
 	p->spawnX = p->x; p->spawnY = p->y; p->spawnZ = p->z;
 	p->health = PLAYER_MAX_HEALTH;
 	p->fallDistance = 0.0f;
 	p->hurtResistantTime = 0;
 	p->lastDamage = 0.0f;
+	p->serverDriven = 0;
+	p->gameMode = 0;
+	p->itemInUse = 0;
+	p->itemInUseCount = 0;
+	Pose_Init(&p->pose, p->yaw, p->pitch);
 	Inventory_Init(&p->inventory);
 }
 
-void Player_Look(Player *p, int chan) {
-	p->yaw   -= deadzone(PAD_SubStickX(chan)) * LOOK_SPEED;
-	p->pitch += deadzone(PAD_SubStickY(chan)) * LOOK_SPEED;
+void Player_Look(Player *p, float dYaw, float dPitch) {
+	p->yaw   += dYaw;
+	p->pitch += dPitch;
 	if (p->pitch >  PITCH_LIMIT) p->pitch =  PITCH_LIMIT;
 	if (p->pitch < -PITCH_LIMIT) p->pitch = -PITCH_LIMIT;
 }
 
-void Player_Tick(Player *p, const World *w, int chan, int frozen) {
+void Player_Tick(Player *p, const World *w, const PlayerInput *in) {
 	p->prevX = p->x;
 	p->prevY = p->y;
 	p->prevZ = p->z;
@@ -434,45 +645,39 @@ void Player_Tick(Player *p, const World *w, int chan, int frozen) {
 	if (p->jumpTicks > 0) p->jumpTicks--;
 	/* EntityLivingBase.onEntityUpdate: tick down the post-hit invuln window. */
 	if (p->hurtResistantTime > 0) p->hurtResistantTime--;
+	if (p->itemInUseCount > 0) p->itemInUseCount--;
 
-	/* Minecraft's MovementInputFromOptions maps the WASD keys to moveForward/
-	 * moveStrafe of exactly +/-1 (keyboard input is binary). The GameCube
-	 * analog stick can't reach magnitude 1.0 at full deflection -- physically
-	 * it tops out near raw +/-100, well under the +/-127 range -- so a naive
-	 * normalisation caps speed below Minecraft's and never satisfies the
-	 * sprint test. We therefore digitise it: past the deadzone counts as a
-	 * full +/-1 in that axis, giving true Minecraft walk speed and diagonals. */
-	int rawX = PAD_StickX(chan);
-	int rawY = PAD_StickY(chan);
-	float forward = (rawY >  MOVE_DEADZONE) ?  1.0f
-	              : (rawY < -MOVE_DEADZONE) ? -1.0f : 0.0f;   /* up = +forward   */
-	float strafe  = (rawX >  MOVE_DEADZONE) ?  1.0f
-	              : (rawX < -MOVE_DEADZONE) ? -1.0f : 0.0f;   /* right = +strafe */
+	/* Entity.onEntityUpdate's fluid pass, before movement. Being in one zeroes
+	 * the fall distance every tick, which is exactly what makes an MLG water
+	 * bucket work: land in the block you just placed and the accumulated fall
+	 * never gets cashed in. */
+	p->inWater = in_water(p, w);
+	p->inLava  = in_lava(p, w);
+	if (p->inWater || p->inLava) p->fallDistance = 0.0f;
 
-	u32 held = PAD_ButtonsHeld(chan);
-	int jump  = (held & PAD_BUTTON_A) != 0;
-	int sneak = (held & PAD_BUTTON_B) != 0;
-	/* sprint on R: the digital click or the analog trigger past a threshold */
-	int sprintHeld = (held & PAD_TRIGGER_R) != 0 || PAD_TriggerR(chan) > SPRINT_TRIGGER;
-
-	/* Inventory screen open (or otherwise gated): drop all control input but
-	 * keep simulating so gravity/friction still settle the player. */
-	if (frozen) { forward = strafe = 0.0f; jump = sneak = 0; sprintHeld = 0; }
+	float forward = in->moveForward;
+	float strafe  = in->moveStrafe;
+	int jump  = in->jump;
+	int sneak = in->sneak;
+	p->sneaking = sneak;
 
 	/* Sprint requires walking forward and not sneaking (EntityPlayerSP). */
-	if (sprintHeld && forward > 0.0f && !sneak) p->sprinting = 1;
+	if (in->sprintHeld && forward > 0.0f && !sneak && !p->itemInUse) p->sprinting = 1;
 	if (forward <= 0.0f || p->isCollidedHorizontally || sneak) p->sprinting = 0;
 
 	if (sneak) { strafe *= 0.3f; forward *= 0.3f; }
+	if (p->itemInUse) { strafe *= ITEM_USE_SLOWDOWN; forward *= ITEM_USE_SLOWDOWN; }
 
 	/* clamp tiny residual motion to zero (EntityLivingBase.onLivingUpdate) */
 	if (fabs(p->motionX) < 0.005) p->motionX = 0.0;
 	if (fabs(p->motionY) < 0.005) p->motionY = 0.0;
 	if (fabs(p->motionZ) < 0.005) p->motionZ = 0.0;
 
-	/* jump handling */
+	/* jump handling -- in a liquid it is a steady push up rather than a leap */
 	if (jump) {
-		if (p->onGround && p->jumpTicks == 0) {
+		if (p->inWater || p->inLava) {
+			p->motionY += LIQUID_JUMP;
+		} else if (p->onGround && p->jumpTicks == 0) {
 			player_jump(p);
 			p->jumpTicks = JUMP_COOLDOWN_TICKS;
 		}
@@ -491,10 +696,48 @@ void Player_Tick(Player *p, const World *w, int chan, int frozen) {
 	 * vertical displacement; do it here with the same delta once per tick. */
 	updateFallState(p, p->y - preY);
 
-	/* Minimal death handling: fall damage is currently the only way to lose
-	 * health, so a lethal fall just respawns at the spawn point with full
-	 * health. (No item drops -- the inventory pickup path doesn't exist yet.) */
-	if (p->health <= 0.0f) player_respawn(p);
+	/* Offline, fall damage is the only way to lose health and a lethal fall
+	 * just respawns at the spawn point. In a live game the server owns this
+	 * entirely -- it cancels lethal damage and drops you into spectator (T26),
+	 * so predicting a respawn here would fight S06 UpdateHealth. */
+	if (!p->serverDriven && p->health <= 0.0f) player_respawn(p);
+
+	/* Animation last, off the movement that actually resolved. */
+	Pose_Tick(&p->pose, p->x - p->prevX, p->z - p->prevZ, p->yaw, p->pitch);
+	p->pose.sneaking  = (u8)sneak;
+	p->pose.sprinting = (u8)p->sprinting;
+	p->pose.onGround  = (u8)p->onGround;
+}
+
+void Player_TickSpectator(Player *p, const PlayerInput *in) {
+	p->prevX = p->x;
+	p->prevY = p->y;
+	p->prevZ = p->z;
+
+	double s = sin(p->yaw * DEG2RAD);
+	double c = cos(p->yaw * DEG2RAD);
+	double fwd = in->moveForward, str = in->moveStrafe;
+
+	p->motionX = (fwd * (-s) + str * ( c)) * SPECTATOR_SPEED;
+	p->motionZ = (fwd * (-c) + str * (-s)) * SPECTATOR_SPEED;
+	p->motionY = (in->jump ? SPECTATOR_SPEED : 0.0) -
+	             (in->sneak ? SPECTATOR_SPEED : 0.0);
+
+	p->x += p->motionX;
+	p->y += p->motionY;
+	p->z += p->motionZ;
+
+	/* A spectator is never on the ground and never falling; saying otherwise
+	 * would have the server run handleFalling against a body it is not
+	 * simulating. */
+	p->onGround = 0;
+	p->isCollidedHorizontally = p->isCollidedVertically = 0;
+	p->fallDistance = 0.0f;
+	p->sprinting = 0;
+	p->sneaking = 0;
+	p->inWater = p->inLava = 0;
+
+	Pose_Tick(&p->pose, p->x - p->prevX, p->z - p->prevZ, p->yaw, p->pitch);
 }
 
 void Player_GetViewMatrix(const Player *p, float alpha, Mtx v) {
@@ -510,4 +753,23 @@ void Player_GetViewMatrix(const Player *p, float alpha, Mtx v) {
 	            (float)(iz * WORLD_BLOCK_SIZE),
 	            p->yaw, p->pitch);
 	Camera_GetViewMatrix(&cam, v);
+
+	/* EntityRenderer.hurtCameraEffect, applied in eye space so it rolls the
+	 * whole view rather than steering the camera: turn the roll axis to face
+	 * the attacker, roll, turn back. The curve is sin(f^4 * pi) -- a sharp
+	 * lurch that decays over the ten hurt ticks. */
+	if (p->pose.hurtTime > 0 && p->pose.maxHurtTime > 0) {
+		float f = ((float)p->pose.hurtTime - alpha) / (float)p->pose.maxHurtTime;
+		if (f > 0.0f) {
+			f = sinf(f * f * f * f * (float)M_PI);
+			float a = p->pose.attackedAtYaw;
+			Mtx h, r;
+			guMtxRotDeg(h, 'y', a);
+			guMtxRotDeg(r, 'z', -f * HURT_TILT_DEGREES);
+			guMtxConcat(h, r, h);
+			guMtxRotDeg(r, 'y', -a);
+			guMtxConcat(h, r, h);
+			guMtxConcat(h, v, v);
+		}
+	}
 }

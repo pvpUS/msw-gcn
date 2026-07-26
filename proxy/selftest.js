@@ -28,6 +28,19 @@ const { WorldTranslator, popcount16 } = require('./world');
 const { EntityTranslator, firstColourCode,
         LANDED_TICKS: LANDED } = require('./entities');
 const { StateTranslator, windowSlotToEngine, mcYawToGc, gcYawToMc } = require('./state');
+const { NetPlayer, ACTION, DIG } = require('./netplayer');
+
+/** EntityPlayerSP.onUpdateWalkingPlayer's "send one anyway" interval, kept in
+ *  step with netplayer.js by name rather than by a second literal. */
+const POSITION_FORCE_TICKS = 20;
+
+/** The console's GC_C_USE_ENTITY payload: s32 eid, u8 action. */
+function entityMsg(eid, action) {
+    const b = Buffer.alloc(5);
+    b.writeInt32BE(eid, 0);
+    b.writeUInt8(action, 4);
+    return b;
+}
 
 let pass = 0, fail = 0;
 const ok = (cond, what) => {
@@ -812,6 +825,12 @@ section('player state translation');
         eq(s.x, map.originX + 11, 'a relative x is added to the current one');
         eq(s.y, 0, 'while a clear bit replaces outright');
         eq(s.teleportEpoch, 2, 'each teleport bumps the epoch');
+
+        // A console attaching mid-game has to be told where it is, or it never
+        // learns the epoch and therefore never sends a single MOVE.
+        const before = of(S.TELEPORT).length;
+        s.onConsoleAttached();
+        eq(of(S.TELEPORT).length, before + 1, 'attaching restates the position');
     }
 
     // -- health, xp, game mode, held slot.
@@ -854,11 +873,10 @@ section('player state translation');
         eq(byslot.size, 40, 'the 40 console slots');
         eq(byslot.get(0).item, bm.toItem(276, 0), 'window 36 -> hotbar 0');
         eq(byslot.get(0).count, 1, 'with its count');
-        // The helmet lands in the right slot, but the diamond armor icons have
-        // no atlas art yet (T13), so its item resolves to the air sentinel --
-        // which is the documented behaviour for an item the palette cannot draw.
-        eq(bm.toItem(310, 0), null, 'diamond helmet art is still missing');
-        eq(byslot.get(39).item, AIR, 'window 5 -> armor helmet, drawn as nothing for now');
+        // T13 gave the whole kit atlas art, armor included, so the helmet now
+        // resolves to a real tile rather than to the air sentinel.
+        ok(bm.toItem(310, 0) !== null, 'diamond helmet has art');
+        eq(byslot.get(39).item, bm.toItem(310, 0), 'window 5 -> armor helmet');
         eq(byslot.get(9).item, bm.toGlobal(1 << 4), 'a block item resolves through the states');
         eq(byslot.get(9).count, 64, 'a full stack');
         eq(byslot.get(20).item, AIR, 'an empty slot is the air sentinel');
@@ -907,6 +925,242 @@ section('player state translation');
         s.say('   ');
         eq(s._chatQueue.length, 2, 'an empty line is not queued');
         s.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
+section('outbound protocol conformance (T22)');
+{
+    const { C, S, ENT } = gclink;
+    const map = mapdb.get('hontori');
+
+    /** A NetPlayer wired to fakes, plus the two lists everything is asserted
+     *  against: what went to the server, and what went back to the console. */
+    const make = () => {
+        const written = [];
+        const sent = [];
+        const link = { attached: true, send: (t, p) => sent.push([t, Buffer.from(p)]) };
+        const state = {
+            selfEid: 7, teleportEpoch: 0, x: 0, y: 0, z: 0, yaw: 0, pitch: 0,
+            heldSlot: 0,
+            heldItem: () => ({ blockId: 276, itemCount: 1, itemDamage: 0 }),
+            say() {}, sendAllSlots() {}, sendHealth() {}, sendGameMode() {},
+        };
+        const entities = { typeOf: (eid) => ({ 100: ENT.PLAYER, 101: ENT.ARROW,
+                                               102: ENT.ITEM, 103: ENT.DRAGON })[eid] };
+        const p = new NetPlayer({ link, state, entities,
+                                  log: { info() {}, warn() {}, error() {} } });
+        p.attach({ write: (name, pkt) => written.push([name, pkt]) });
+        p.setMap(map);
+        return { p, state, written, sent,
+                 of: (name) => written.filter((w) => w[0] === name),
+                 to: (t) => sent.filter((x) => x[0] === t) };
+    };
+
+    /** The console's MOVE, byte for byte as netgame.c builds it. */
+    const move = (x, y, z, yaw, pitch, flags, epoch) => {
+        const b = Buffer.alloc(34);
+        b.writeDoubleBE(x, 0); b.writeDoubleBE(y, 8); b.writeDoubleBE(z, 16);
+        b.writeFloatBE(yaw, 24); b.writeFloatBE(pitch, 28);
+        b.writeUInt8(flags, 32); b.writeUInt8(epoch, 33);
+        return b;
+    };
+
+    // -- packet selection: the four movement packets, chosen by what changed.
+    {
+        const { p, written } = make();
+        p.onMessage(C.MOVE, move(0, 64, 0, 0, 0, 1, 0));
+        eq(written.pop()[0], 'position_look', 'the first MOVE states everything');
+
+        p.onMessage(C.MOVE, move(0, 64, 0, 0, 0, 1, 0));
+        eq(written.pop()[0], 'flying', 'standing still is C03 onGround only');
+
+        p.onMessage(C.MOVE, move(0, 64, 0, 90, 0, 1, 0));
+        eq(written.pop()[0], 'look', 'turning on the spot is C05');
+
+        p.onMessage(C.MOVE, move(2, 64, 0, 90, 0, 1, 0));
+        eq(written.pop()[0], 'position', 'walking without turning is C04');
+
+        p.onMessage(C.MOVE, move(4, 64, 0, 45, 0, 1, 0));
+        eq(written.pop()[0], 'position_look', 'both at once is C06');
+
+        // Sub-threshold drift must not count as movement, or a standing player
+        // sends a position every tick and the server's own smoothing fights it.
+        p.onMessage(C.MOVE, move(4.01, 64, 0, 45, 0, 1, 0));
+        eq(written.pop()[0], 'flying', 'a 0.01-block drift is below the threshold');
+
+        // ...but twenty ticks of that forces one anyway.
+        for (let i = 0; i < POSITION_FORCE_TICKS; i++) {
+            p.onMessage(C.MOVE, move(4.01, 64, 0, 45, 0, 1, 0));
+        }
+        eq(written.pop()[0], 'position', 'a full position at least every 20 ticks');
+    }
+
+    // -- the coordinate and angle conversion, at the one boundary it happens.
+    {
+        const { p, of } = make();
+        p.onMessage(C.MOVE, move(1, 2, 3, 180, 10, 1, 0));
+        const pk = of('position_look')[0][1];
+        eq(pk.x, map.originX + 1, 'local x plus the map origin');
+        eq(pk.y, map.originY + 2, 'y is the AABB minY, straight through');
+        eq(pk.z, map.originZ + 3, 'local z plus the map origin');
+        eq(pk.yaw, 0, 'GC yaw 180 is MC yaw 0');
+        eq(pk.pitch, -10, 'pitch is negated back');
+        eq(pk.onGround, true, 'the onGround flag survives');
+        // Round trip, in both directions: a sign error here reads as "moved
+        // wrongly" rather than as anything anyone can see.
+        for (const g of [0, 45, 90, -90, 179.5, -179.5]) {
+            ok(Math.abs(mcYawToGc(gcYawToMc(g)) - g) < 1e-4,
+               `yaw round trip at ${g}`);
+        }
+    }
+
+    // -- the teleport epoch: MOVEs in flight across an S08 are discarded.
+    {
+        const { p, state, written } = make();
+        p.onMessage(C.MOVE, move(0, 64, 0, 0, 0, 1, 0));
+        written.length = 0;
+
+        state.teleportEpoch = 1;                       // the server moved us
+        p.onMessage(C.MOVE, move(500, 64, 500, 0, 0, 1, 0));
+        eq(written.length, 0, 'a MOVE with a stale epoch is dropped');
+        eq(p.stats.stale, 1, 'and counted');
+
+        p.onMessage(C.MOVE, move(500, 64, 500, 0, 0, 1, 1));
+        eq(written.length, 1, 'the same MOVE at the new epoch goes through');
+    }
+
+    // -- C0B: server-side sprint exists only because of these.
+    {
+        const { p, of } = make();
+        p.onMessage(C.MOVE, move(0, 64, 0, 0, 0, 0x01, 0));
+        eq(of('entity_action').length, 0, 'no edge, no packet');
+
+        p.onMessage(C.MOVE, move(1, 64, 0, 0, 0, 0x03, 0));   // + sprinting
+        eq(of('entity_action').length, 1, 'starting to sprint is one C0B');
+        eq(of('entity_action')[0][1].actionId, ACTION.START_SPRINTING, 'START_SPRINTING');
+
+        p.onMessage(C.MOVE, move(2, 64, 0, 0, 0, 0x03, 0));
+        eq(of('entity_action').length, 1, 'holding it sends nothing further');
+
+        p.onMessage(C.MOVE, move(3, 64, 0, 0, 0, 0x05, 0));   // sneak, not sprint
+        eq(of('entity_action').length, 3, 'stopping one and starting the other');
+        eq(of('entity_action')[1][1].actionId, ACTION.STOP_SPRINTING, 'STOP_SPRINTING');
+        eq(of('entity_action')[2][1].actionId, ACTION.START_SNEAKING, 'START_SNEAKING');
+    }
+
+    // -- the 1.8 sprint-reset asymmetry. The server clears its own sprint flag
+    //    on a hit and never says so; re-sending START_SPRINTING is the classic
+    //    custom-client tell, so an attack must leave sentSprint alone.
+    {
+        const { p, of } = make();
+        p.onMessage(C.MOVE, move(0, 64, 0, 0, 0, 0x03, 0));
+        const before = of('entity_action').length;
+        p.onMessage(C.USE_ENTITY, entityMsg(100, 1));
+        p.onMessage(C.MOVE, move(1, 64, 0, 0, 0, 0x03, 0));
+        eq(of('entity_action').length, before,
+           'attacking mid-sprint does not re-send START_SPRINTING');
+        ok(p.sentSprint === true, 'and the believed sprint state is untouched');
+    }
+
+    // -- C02 filter. Attacking the wrong thing is a kick, not a no-op.
+    {
+        const { p, of } = make();
+        p.onMessage(C.USE_ENTITY, entityMsg(100, 1));
+        eq(of('use_entity').length, 1, 'a player may be attacked');
+        p.onMessage(C.USE_ENTITY, entityMsg(103, 1));
+        eq(of('use_entity').length, 2, 'so may the dragon');
+        p.onMessage(C.USE_ENTITY, entityMsg(101, 1));
+        p.onMessage(C.USE_ENTITY, entityMsg(102, 1));
+        p.onMessage(C.USE_ENTITY, entityMsg(7, 1));      // ourselves
+        p.onMessage(C.USE_ENTITY, entityMsg(999, 1));    // not tracked
+        eq(of('use_entity').length, 2, 'an arrow, an item, ourselves and a stranger are all refused');
+        eq(p.stats.rejected, 4, 'and all four counted');
+    }
+
+    // -- dig and place: the origin is added back, the held stack filled in.
+    {
+        const { p, of } = make();
+        const dig = Buffer.alloc(8);
+        dig.writeUInt8(0, 0);
+        dig.writeInt16BE(10, 1); dig.writeInt16BE(20, 3); dig.writeInt16BE(-5, 5);
+        dig.writeUInt8(1, 7);
+        p.onMessage(C.DIG, dig);
+        const d = of('block_dig')[0][1];
+        eq(d.status, 0, 'START_DESTROY_BLOCK');
+        eq(d.location.x, map.originX + 10, 'dig x is absolute');
+        eq(d.location.z, map.originZ - 5, 'and signed');
+
+        // 3-5 are this proxy's to send; a console claiming one is ignored.
+        const bad = Buffer.from(dig); bad.writeUInt8(4, 0);
+        p.onMessage(C.DIG, bad);
+        eq(of('block_dig').length, 1, 'a console-sent DROP_ITEM dig status is refused');
+
+        const place = Buffer.alloc(10);
+        place.writeInt16BE(1, 0); place.writeInt16BE(2, 2); place.writeInt16BE(3, 4);
+        place.writeUInt8(1, 6);
+        place.writeUInt8(8, 7); place.writeUInt8(15, 8); place.writeUInt8(0, 9);
+        p.onMessage(C.PLACE, place);
+        const pl = of('block_place')[0][1];
+        eq(pl.location.y, map.originY + 2, 'place y is absolute');
+        eq(pl.heldItem.blockId, 276, 'the held stack comes from the server mirror');
+        eq(pl.cursorY, 15, 'the cursor position in sixteenths');
+    }
+
+    // -- item use: a hold reports USE_STATE, an instant one does not.
+    {
+        const { p, of, to, state } = make();
+        p.onMessage(C.USE_ITEM, Buffer.from([0]));
+        eq(of('block_place').length, 1, 'a use with no target is a C08 at -1');
+        eq(of('block_place')[0][1].location.x, -1, 'at (-1,-1,-1)');
+        eq(to(S.USE_STATE).length, 0, 'a sword is instant, so no slowdown');
+
+        state.heldItem = () => ({ blockId: 261, itemCount: 1, itemDamage: 0 });  // bow
+        p.onMessage(C.USE_ITEM, Buffer.from([0]));
+        eq(to(S.USE_STATE).pop()[1].readUInt8(0), 1, 'drawing a bow slows movement');
+        p.onMessage(C.USE_ITEM, Buffer.from([1]));
+        eq(of('block_dig').pop()[1].status, DIG.RELEASE_USE_ITEM, 'release is C07 status 5');
+        eq(to(S.USE_STATE).pop()[1].readUInt8(0), 0, 'and clears the slowdown');
+
+        // A splash potion is thrown, not drunk: the splash bit is what tells
+        // the two apart, and getting it wrong slows the player for 32 ticks
+        // they were never using anything.
+        state.heldItem = () => ({ blockId: 373, itemCount: 1, itemDamage: 16386 });
+        p.onMessage(C.USE_ITEM, Buffer.from([0]));
+        eq(to(S.USE_STATE).length, 2, 'a splash potion starts no hold');
+        state.heldItem = () => ({ blockId: 373, itemCount: 1, itemDamage: 3 });
+        p.onMessage(C.USE_ITEM, Buffer.from([0]));
+        eq(to(S.USE_STATE).pop()[1].readUInt8(0), 1, 'a drinkable one does');
+    }
+
+    // -- held slot, swing, drop, transaction.
+    {
+        const { p, of, state } = make();
+        p.onMessage(C.HELD_SLOT, Buffer.from([4]));
+        eq(of('held_item_slot')[0][1].slotId, 4, 'C09 carries the absolute slot');
+        eq(state.heldSlot, 4, 'and the mirror follows, so C08 sends the right stack');
+        p.onMessage(C.HELD_SLOT, Buffer.from([4]));
+        eq(of('held_item_slot').length, 1, 'no packet when nothing changed');
+
+        p.onMessage(C.SWING, Buffer.alloc(0));
+        eq(of('arm_animation').length, 1, 'a swing is C0A, hit or miss');
+
+        p.onMessage(C.ACTION, Buffer.from([0]));
+        eq(of('block_dig').pop()[1].status, DIG.DROP_ONE, 'drop item is C07 status 4');
+
+        p.onTransaction({ windowId: 0, action: 42 });
+        const t = of('transaction')[0][1];
+        eq(t.action, 42, 'S32 is acked with its own action id');
+        eq(t.accepted, true, 'and accepted');
+    }
+
+    // -- a detached console must not leave the account sprinting forever.
+    {
+        const { p, of } = make();
+        p.onMessage(C.MOVE, move(0, 64, 0, 0, 0, 0x07, 0));
+        eq(of('entity_action').length, 2, 'sprinting and sneaking both started');
+        p.onConsoleDetached();
+        eq(of('entity_action').length, 4, 'and both stopped when the link dropped');
     }
 }
 

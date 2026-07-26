@@ -10,7 +10,9 @@
 
 #define DEG2RAD 0.017453292519943295
 
-/* PlayerControllerMP.getBlockReachDistance(): 4.5 outside creative. */
+/* PlayerControllerMP.getBlockReachDistance(): 4.5 outside creative. Entities
+ * are shorter (REACH_ENTITY, entity.h) and the two are separate numbers in
+ * vanilla for a reason -- an attack sent at four blocks is rejected. */
 #define REACH_DISTANCE 4.5
 
 /* Minecraft.rightClickDelayTimer: ticks between repeats while use is held. */
@@ -29,23 +31,58 @@ static const int hIndexToFacing[4] = { 3, 4, 2, 5 };
 #define FACE_DOWN 2
 #define FACE_UP   3
 
+/* ---- outbound intent (T14) --------------------------------------------- */
+
+static InteractEvent *push_event(Interact *in, u8 kind, u8 status) {
+	if (in->evCount >= INTERACT_EVENT_MAX) return NULL;
+	InteractEvent *e = &in->ev[in->evCount++];
+	memset(e, 0, sizeof(*e));
+	e->kind = kind;
+	e->status = status;
+	return e;
+}
+
+static void emit_dig(Interact *in, u8 status, int bx, int by, int bz, int face) {
+	InteractEvent *e = push_event(in, INTERACT_EV_DIG, status);
+	if (!e) return;
+	e->bx = (s16)bx; e->by = (s16)by; e->bz = (s16)bz;
+	e->face = (u8)faceToFacing[face & 5];
+}
+
 /* ---- targeting --------------------------------------------------------- */
 
 /* Minecraft.getMouseOver: a ray from the eye along the look vector, out to the
- * controller's reach. The look vector matches camera.c's convention (yaw 0
- * faces -Z, positive pitch looks up). */
-static void update_target(Interact *in, const World *w, const Player *p) {
+ * controller's reach, then the entity pass over whatever it found. The look
+ * vector matches camera.c's convention (yaw 0 faces -Z, positive pitch looks
+ * up). */
+static void update_target(Interact *in, const World *w, const Player *p,
+                          const EntityWorld *ew) {
 	double yaw = p->yaw * DEG2RAD, pitch = p->pitch * DEG2RAD;
 	double cp = cos(pitch);
 	double lx = -sin(yaw) * cp;
 	double ly =  sin(pitch);
 	double lz = -cos(yaw) * cp;
 
-	double ex = p->x, ey = p->y + 1.62, ez = p->z;
+	double ex = p->x, ey = p->y + PLAYER_EYE_HEIGHT, ez = p->z;
 	in->hasTarget = World_RayTrace(w, ex, ey, ez,
 	                               ex + lx * REACH_DISTANCE,
 	                               ey + ly * REACH_DISTANCE,
 	                               ez + lz * REACH_DISTANCE, &in->target);
+
+	/* How far the blocks stopped the ray, in blocks: World_RayTrace works in
+	 * the [0,1] parameter of the segment it was given, and the hit point is
+	 * already in world units, so measure that instead of re-deriving t. */
+	double blockT = REACH_DISTANCE;
+	if (in->hasTarget) {
+		double dx = in->target.hx - ex, dy = in->target.hy - ey,
+		       dz = in->target.hz - ez;
+		blockT = sqrt(dx*dx + dy*dy + dz*dz);
+	}
+
+	in->hasEntity = 0;
+	if (ew && Entity_RayTrace(ew, ex, ey, ez, lx, ly, lz,
+	                          REACH_ENTITY, blockT, ew->selfEid, &in->entity))
+		in->hasEntity = 1;
 }
 
 static int held_item(Player *p) {
@@ -74,14 +111,21 @@ static void drop_block(ItemWorld *iw, int id, int bx, int by, int bz) {
 }
 
 /* ItemInWorldManager.tryHarvestBlock's core: remove the block, and only spawn
- * its drops when the held item was actually able to harvest it. */
+ * its drops when the held item was actually able to harvest it.
+ *
+ * The removal stays even in a live game -- that is PlayerControllerMP
+ * .onPlayerDestroyBlock, and it is the client prediction that makes mining
+ * feel instant instead of costing a round trip. The server's BLOCK_SET is
+ * still the truth and will put the block back if it disagrees. The *drops* are
+ * a different matter: those arrive as real entities, so predicting them would
+ * duplicate every one. */
 static void destroy_block(Interact *in, World *w, Player *p, ItemWorld *iw,
                           int bx, int by, int bz) {
 	int id = World_GetBlock(w, bx, by, bz);
 	if (id < 0) return;
 	int canHarvest = Block_CanHarvest(id, held_item(p));
 	if (!World_SetBlock(w, bx, by, bz, -1)) return;
-	if (canHarvest) drop_block(iw, id, bx, by, bz);
+	if (canHarvest && !p->serverDriven) drop_block(iw, id, bx, by, bz);
 	(void)in;
 }
 
@@ -95,6 +139,9 @@ static int hitting_position(const Interact *in, Player *p, int bx, int by, int b
 /* PlayerControllerMP.resetBlockRemoving. */
 static void reset_block_removing(Interact *in) {
 	if (in->isHittingBlock) {
+		/* C07 ABORT_DESTROY_BLOCK, with EnumFacing.DOWN exactly as vanilla
+		 * sends it -- the server ignores the face on an abort. */
+		emit_dig(in, DIG_ABORT, in->curBx, in->curBy, in->curBz, FACE_DOWN);
 		in->isHittingBlock = 0;
 		in->curBlockDamage = 0.0f;
 	}
@@ -104,13 +151,17 @@ static void reset_block_removing(Interact *in) {
  * it outright when one tick of progress is already >= 1.0 (dirt with a shovel,
  * flowers with anything). */
 static void click_block(Interact *in, World *w, Player *p, ItemWorld *iw,
-                        int bx, int by, int bz) {
+                        int bx, int by, int bz, int face) {
 	if (in->isHittingBlock && hitting_position(in, p, bx, by, bz)) return;
 
 	int id = World_GetBlock(w, bx, by, bz);
 	if (id < 0) return;
 
+	emit_dig(in, DIG_START, bx, by, bz, face);
+
 	if (Block_PlayerRelativeHardness(id, held_item(p), p->onGround) >= 1.0f) {
+		/* Instant break: vanilla sends only the START and destroys it locally,
+		 * which is why there is no STOP here. */
 		destroy_block(in, w, p, iw, bx, by, bz);
 		in->isHittingBlock = 0;
 		in->curBlockDamage = 0.0f;
@@ -126,11 +177,11 @@ static void click_block(Interact *in, World *w, Player *p, ItemWorld *iw,
 
 /* PlayerControllerMP.onPlayerDamageBlock. */
 static void damage_block(Interact *in, World *w, Player *p, ItemWorld *iw,
-                         int bx, int by, int bz) {
+                         int bx, int by, int bz, int face) {
 	if (in->blockHitDelay > 0) { in->blockHitDelay--; return; }
 
 	if (!in->isHittingBlock || !hitting_position(in, p, bx, by, bz)) {
-		click_block(in, w, p, iw, bx, by, bz);
+		click_block(in, w, p, iw, bx, by, bz, face);
 		return;
 	}
 
@@ -140,8 +191,13 @@ static void damage_block(Interact *in, World *w, Player *p, ItemWorld *iw,
 	in->curBlockDamage +=
 		Block_PlayerRelativeHardness(id, held_item(p), p->onGround);
 
+	/* Minecraft.sendClickBlockToController swings the arm on every tick that
+	 * damages a block, which is what makes held-button mining animate. */
+	Pose_Swing(&p->pose);
+
 	if (in->curBlockDamage >= 1.0f) {
 		in->isHittingBlock = 0;
+		emit_dig(in, DIG_STOP, bx, by, bz, face);
 		destroy_block(in, w, p, iw, bx, by, bz);
 		in->curBlockDamage = 0.0f;
 		in->blockHitDelay = 5;
@@ -223,14 +279,16 @@ static int placed_id(int heldId, int face, double hitY, const Player *p) {
 	return v >= 0 ? v : heldId;
 }
 
-/* World.checkNoEntityCollision for the one entity that exists: the player. */
+/* World.checkNoEntityCollision for the one entity that exists locally: the
+ * player. Remote players are the server's problem -- it re-runs this check and
+ * rejects the placement, which the following BLOCK_SET undoes. */
 static int fits_around_player(const World *w, const Player *p, int id,
                               int bx, int by, int bz) {
 	BlockAABB boxes[2];
 	int n = World_BlockBoxesFor(w, id, bx, by, bz, boxes);
-	double hw = 0.6 * 0.5;
+	double hw = PLAYER_WIDTH * 0.5;
 	double pminX = p->x - hw, pmaxX = p->x + hw;
-	double pminY = p->y,      pmaxY = p->y + 1.8;
+	double pminY = p->y,      pmaxY = p->y + PLAYER_HEIGHT;
 	double pminZ = p->z - hw, pmaxZ = p->z + hw;
 	int k;
 	for (k = 0; k < n; k++) {
@@ -242,11 +300,38 @@ static int fits_around_player(const World *w, const Player *p, int id,
 	return 1;
 }
 
-/* ItemBlock.onItemUse. Returns 1 if a block was placed. */
-static int place_block(World *w, Player *p, const BlockHit *hit) {
+/* ItemBlock.onItemUse, plus the C08 the server needs whatever is held.
+ *
+ * The packet goes out for *any* held item, not just a placeable one: a water
+ * bucket, a lava bucket and an ender pearl aimed at the ground all right-click
+ * a block, and it is the server that decides what that means. Only the local
+ * prediction is limited to ItemBlocks. Returns 1 if the repeat timer should
+ * start. */
+static int place_block(Interact *in, World *w, Player *p, const BlockHit *hit) {
 	ItemStack *held = Inventory_GetCurrentItem(&p->inventory);
-	if (!held || held->count == 0) return 0;
-	if (held->item < 0 || held->item >= NUM_BLOCK_IDS) return 0;  /* not an ItemBlock */
+
+	/* C08's cursor position: the hit point relative to the clicked block, in
+	 * sixteenths. Clamped because a hit exactly on the far face lands on 16. */
+	int cx = (int)((hit->hx - hit->bx) * 16.0);
+	int cy = (int)((hit->hy - hit->by) * 16.0);
+	int cz = (int)((hit->hz - hit->bz) * 16.0);
+	if (cx < 0) cx = 0;
+	if (cx > 15) cx = 15;
+	if (cy < 0) cy = 0;
+	if (cy > 15) cy = 15;
+	if (cz < 0) cz = 0;
+	if (cz > 15) cz = 15;
+
+	InteractEvent *ev = push_event(in, INTERACT_EV_PLACE, 0);
+	if (ev) {
+		ev->bx = (s16)hit->bx; ev->by = (s16)hit->by; ev->bz = (s16)hit->bz;
+		ev->face = (u8)faceToFacing[hit->face & 5];
+		ev->curX = (u8)cx; ev->curY = (u8)cy; ev->curZ = (u8)cz;
+	}
+	Pose_Swing(&p->pose);
+
+	if (!held || held->count == 0) return 1;
+	if (held->item < 0 || held->item >= NUM_BLOCK_IDS) return 1;  /* not an ItemBlock */
 
 	int bx = hit->bx, by = hit->by, bz = hit->bz;
 	double hitY = hit->hy - by;                  /* hitY, relative to the clicked block */
@@ -256,12 +341,12 @@ static int place_block(World *w, Player *p, const BlockHit *hit) {
 		by += faceStep[hit->face][1];
 		bz += faceStep[hit->face][2];
 	}
-	if (!World_InBounds(w, bx, by, bz)) return 0;
-	if (!is_replaceable(World_GetBlock(w, bx, by, bz))) return 0;
+	if (!World_InBounds(w, bx, by, bz)) return 1;
+	if (!is_replaceable(World_GetBlock(w, bx, by, bz))) return 1;
 
 	int id = placed_id(held->item, hit->face, hitY, p);
-	if (!fits_around_player(w, p, id, bx, by, bz)) return 0;
-	if (!World_SetBlock(w, bx, by, bz, id)) return 0;
+	if (!fits_around_player(w, p, id, bx, by, bz)) return 1;
+	if (!World_SetBlock(w, bx, by, bz, id)) return 1;
 
 	if (--held->count == 0) { held->item = -1; held->meta = 0; }
 	return 1;
@@ -276,27 +361,45 @@ void Interact_Init(Interact *in) {
 }
 
 void Interact_Tick(Interact *in, World *w, Player *p, ItemWorld *iw,
-                   int attackHeld, int useHeld, int frozen) {
-	update_target(in, w, p);
+                   const PlayerInput *input, const EntityWorld *ew) {
+	in->evCount = 0;
+	update_target(in, w, p, ew);
 
 	if (in->placeDelay > 0) in->placeDelay--;
 
-	if (frozen) { reset_block_removing(in); return; }
-
 	/* Minecraft.runTick's sendClickBlockToController: keep damaging while the
-	 * attack button is held and a block is under the crosshair, otherwise
-	 * abandon any dig in progress. */
-	if (attackHeld && in->hasTarget)
-		damage_block(in, w, p, iw, in->target.bx, in->target.by, in->target.bz);
+	 * attack button is held and a *block* is under the crosshair. An entity in
+	 * front of it takes the click instead (combat.c), which is why the entity
+	 * test comes first here rather than being a separate branch later. */
+	if (input->attackHeld && in->hasTarget && !in->hasEntity)
+		damage_block(in, w, p, iw, in->target.bx, in->target.by, in->target.bz,
+		             in->target.face);
 	else
 		reset_block_removing(in);
 
-	/* Minecraft.rightClickMouse, repeat-limited the same way. */
-	if (useHeld && in->hasTarget && in->placeDelay == 0) {
-		if (place_block(w, p, &in->target)) in->placeDelay = PLACE_REPEAT_DELAY;
-	} else if (!useHeld) {
+	/* Minecraft.rightClickMouse, repeat-limited the same way. With nothing
+	 * under the crosshair the same press is an item use instead -- drawing the
+	 * bow, eating, throwing a pearl -- which vanilla sends as a C08 at
+	 * (-1,-1,-1) and this link carries as USE_ITEM. */
+	if (input->useHeld && in->hasTarget && in->placeDelay == 0) {
+		if (place_block(in, w, p, &in->target)) in->placeDelay = PLACE_REPEAT_DELAY;
+	} else if (!input->useHeld) {
 		in->placeDelay = 0;
 	}
+
+	if (input->useHeld) {
+		if (!in->useWasHeld && !in->hasTarget) {
+			push_event(in, INTERACT_EV_USE, USE_START);
+			in->useStarted = 1;
+		}
+	} else if (in->useStarted) {
+		/* Gated on the start, not on the button, the same way vanilla gates
+		 * onStoppedUsingItem on isUsingItem: a release with no draw behind it
+		 * would cancel whatever the server thought was in progress. */
+		push_event(in, INTERACT_EV_USE, USE_RELEASE);
+		in->useStarted = 0;
+	}
+	in->useWasHeld = input->useHeld ? 1 : 0;
 }
 
 int Interact_BreakStage(const Interact *in) {

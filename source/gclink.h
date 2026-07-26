@@ -154,10 +154,11 @@ enum {
 	/* u32 token, echoed from GC_S_PING */
 	GC_C_PONG       = 0x83,
 
-	/* 20 Hz. double x, y, z; float yaw, pitch; u8 flags, u8 epoch.
+	/* 20 Hz. double x, y, z; float yaw, pitch; u8 flags, u8 epoch.  [34 B]
 	 * flags bit0 onGround, bit1 sprinting, bit2 sneaking. The proxy turns
 	 * this into the right C03/C04/C05/C06 and the C0B sprint/sneak edges
-	 * (T22) -- the console sends intent, not packets. */
+	 * (T22) -- the console sends intent, not packets. Local block space and
+	 * engine angles, the same as TELEPORT arrives in. */
 	GC_C_MOVE       = 0x90,
 	/* u8 status (0 start, 1 abort, 2 stop), s16 x, y, z, u8 face.  [8 B] */
 	GC_C_DIG        = 0x91,
@@ -257,6 +258,38 @@ enum {
 	GCLINK_ANIM_EAT   = 3,
 };
 
+/* GC_C_MOVE flags. */
+enum {
+	GCLINK_MOVE_ONGROUND  = 1 << 0,
+	GCLINK_MOVE_SPRINTING = 1 << 1,
+	GCLINK_MOVE_SNEAKING  = 1 << 2,
+};
+
+/* GC_C_DIG status, matching C07PacketPlayerDigging's first three. */
+enum {
+	GCLINK_DIG_START = 0,
+	GCLINK_DIG_ABORT = 1,
+	GCLINK_DIG_STOP  = 2,
+};
+
+/* GC_C_USE_ENTITY action. */
+enum {
+	GCLINK_USE_INTERACT = 0,
+	GCLINK_USE_ATTACK   = 1,
+};
+
+/* GC_C_USE_ITEM action. */
+enum {
+	GCLINK_ITEM_START   = 0,
+	GCLINK_ITEM_RELEASE = 1,
+};
+
+/* GC_S_GAME_MODE values worth naming. */
+enum {
+	GCLINK_MODE_SURVIVAL  = 0,
+	GCLINK_MODE_SPECTATOR = 3,
+};
+
 /* GC_C_ACTION */
 enum {
 	GCLINK_ACTION_DROP_ITEM  = 0,   /* D-pad Down (T16)                   */
@@ -277,9 +310,27 @@ enum {
 
 static inline void gc_put_u8(u8 *p, u8 v)  { p[0] = v; }
 static inline void gc_put_u16(u8 *p, u16 v) { p[0] = (u8)(v >> 8); p[1] = (u8)v; }
+static inline void gc_put_s16(u8 *p, s16 v) { gc_put_u16(p, (u16)v); }
 static inline void gc_put_u32(u8 *p, u32 v) {
 	p[0] = (u8)(v >> 24); p[1] = (u8)(v >> 16);
 	p[2] = (u8)(v >> 8);  p[3] = (u8)v;
+}
+static inline void gc_put_s32(u8 *p, s32 v) { gc_put_u32(p, (u32)v); }
+
+/* The outbound halves of gc_get_f32/f64, and misaligned for the same reason:
+ * a payload is packed, so the float is memcpy'd into an integer and written a
+ * byte at a time rather than stored through a float pointer that may land on
+ * an odd address. */
+static inline void gc_put_f32(u8 *p, float f) {
+	u32 v;
+	__builtin_memcpy(&v, &f, sizeof v);
+	gc_put_u32(p, v);
+}
+static inline void gc_put_f64(u8 *p, double d) {
+	u64 v;
+	__builtin_memcpy(&v, &d, sizeof v);
+	gc_put_u32(p, (u32)(v >> 32));
+	gc_put_u32(p + 4, (u32)v);
 }
 static inline u8  gc_get_u8(const u8 *p)  { return p[0]; }
 static inline u16 gc_get_u16(const u8 *p) { return (u16)((p[0] << 8) | p[1]); }

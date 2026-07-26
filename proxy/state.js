@@ -67,6 +67,10 @@ class StateTranslator extends EventEmitter {
         this.yaw = 0; this.pitch = 0;
 
         this.slots = new Array(40).fill(null);
+        // Which hotbar slot the server believes is held. C08 BlockPlacement
+        // carries the held stack and the server validates it, so this has to
+        // track S09 *and* the console's own C09 -- see netplayer.onHeldSlot.
+        this.heldSlot = 0;
         this.borderOptedIn = false;
         this._chatQueue = [];
         this._chatAt = 0;
@@ -87,12 +91,20 @@ class StateTranslator extends EventEmitter {
         }
     }
 
-    /** A fresh console knows none of this; state it all again. */
+    /** A fresh console knows none of this; state it all again.
+     *
+     *  The teleport is not optional here even though nothing has moved: the
+     *  console refuses to send any MOVE until it has had one, because before
+     *  that it does not know the epoch to echo. A console that reconnects
+     *  mid-game and never hears one stands perfectly still until the server's
+     *  next S08 -- which, in a game where nothing is teleporting you, may be
+     *  never. */
     onConsoleAttached() {
         this.sendHealth();
         this.sendGameMode();
         this.sendGameState();
         this.sendAllSlots();
+        this.sendTeleport();
     }
 
     // ---- identity and position ---------------------------------------------
@@ -131,6 +143,10 @@ class StateTranslator extends EventEmitter {
         this.teleportEpoch = (this.teleportEpoch + 1) & 0xff;
         this.emit('position', this.x, this.y, this.z);
         this.sendTeleport();
+        // Everything the outbound movement path believes about where we are is
+        // now wrong, including the MOVEs already in flight from the console.
+        // The epoch above discards those; this re-baselines the rest (T22).
+        this.emit('teleport');
     }
 
     /** Local (map-relative) feet position, in the console's coordinate space. */
@@ -245,7 +261,19 @@ class StateTranslator extends EventEmitter {
     /** S09 held_item_slot -- absolute, which is why the console needs an
      *  absolute setter rather than InventoryPlayer's relative scroll. */
     onHeldItemSlot(pkt) {
-        this.link.send(S.HELD_SLOT, new Writer(1).u8(pkt.slot & 7).done());
+        this.heldSlot = pkt.slot & 7;
+        this.link.send(S.HELD_SLOT, new Writer(1).u8(this.heldSlot).done());
+    }
+
+    /** The stack the server thinks is in our hand, in its own wire form, ready
+     *  to go straight back out in a C08. An empty hand is blockId -1, which is
+     *  how the 1.8 slot format spells "nothing". */
+    heldItem() {
+        const it = this.slots[this.heldSlot];
+        if (!it || it.blockId === undefined || it.blockId < 0 || !it.itemCount) {
+            return { blockId: -1 };
+        }
+        return it;
     }
 
     // ---- chat ---------------------------------------------------------------

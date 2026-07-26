@@ -585,6 +585,36 @@ ITEM_TEXTURES = [
     ("BED",             "bed.png",              (190, 60, 60)),
     ("COCOA_BEANS",     "dye_powder_brown.png", (120, 70, 40)),
     ("NETHER_WART",     "nether_wart.png",      (150, 30, 40)),
+    # -- the MegaSkywars kit (T13). KitManager.java:37-122 plus the armor
+    # hardcoded in MapStatus.startGame:935-963. Every one of these is something
+    # a player holds during a game, so it has to have an icon in the hotbar and
+    # a card in the hand; without them the kit renders as nine empty slots.
+    # Names match gen_blockmap.py's ITEM_MAP, which resolves them straight out
+    # of the generated ITEM_<name>_TILE defines.
+    ("BOW",             "bow_standby.png",      (150, 110, 60)),
+    ("ARROW",           "arrow.png",            (200, 200, 200)),
+    ("FISHING_ROD",     "fishing_rod_uncast.png", (160, 120, 70)),
+    ("GOLDEN_APPLE",    "apple_golden.png",     (240, 200, 60)),
+    ("WATER_BUCKET",    "bucket_water.png",     (60, 110, 220)),
+    ("LAVA_BUCKET",     "bucket_lava.png",      (230, 110, 20)),
+    ("ENDER_PEARL",     "ender_pearl.png",      (40, 130, 120)),
+    ("DIAMOND_HELMET",  "diamond_helmet.png",   (90, 210, 220)),
+    ("DIAMOND_CHESTPLATE", "diamond_chestplate.png", (90, 210, 220)),
+    ("DIAMOND_LEGGINGS", "diamond_leggings.png", (90, 210, 220)),
+    ("DIAMOND_BOOTS",   "diamond_boots.png",    (90, 210, 220)),
+]
+
+# Potions. 1.8 has one bottle texture and tints `potion_overlay` per effect
+# (ItemPotion.getColorFromItemStack -> PotionHelper), so an atlas that stores
+# finished tiles has to do the composite at bake time -- there is no per-draw
+# tint in the world shader. Colours are net.minecraft.potion.Potion's own
+# liquidColor constants. The kit carries three: splash speed, splash regen and
+# a drinkable fire resistance (KitManager.java:37-122).
+# (name, bottle texture, liquidColor)
+POTION_TEXTURES = [
+    ("SPLASH_SPEED",            "potion_bottle_splash.png",     0x7CAFC6),
+    ("SPLASH_REGEN",            "potion_bottle_splash.png",     0xCD5CAB),
+    ("FIRE_RESISTANCE_POTION",  "potion_bottle_drinkable.png",  0xE49A3A),
 ]
 
 # Block-breaking crack overlay (destroy_stage_0..9), drawn over the block the
@@ -610,6 +640,27 @@ def load_item_tex(fname):
                 im = im.resize((TILE, TILE), Image.NEAREST)
             return im
     return None
+
+def potion_tex(bottle_file, colour):
+    """One finished potion icon: the greyscale liquid (potion_overlay), tinted
+    by the effect colour, with the glass bottle composited on top -- vanilla's
+    two-layer ItemPotion model flattened, because the atlas stores finished
+    tiles and the world shader has no per-draw tint to apply at render time."""
+    bottle = load_item_tex(bottle_file)
+    overlay = load_item_tex("potion_overlay.png")
+    if bottle is None:
+        return None
+    if overlay is None:
+        return bottle
+    r, g, b = (colour >> 16) & 0xFF, (colour >> 8) & 0xFF, colour & 0xFF
+    px = overlay.load()
+    for y in range(overlay.height):
+        for x in range(overlay.width):
+            pr, pg, pb, pa = px[x, y]
+            px[x, y] = (pr * r // 255, pg * g // 255, pb * b // 255, pa)
+    out = overlay.copy()
+    out.alpha_composite(bottle)
+    return out
 
 def main():
     ids_path = sys.argv[1] if len(sys.argv) > 1 else \
@@ -681,6 +732,10 @@ def main():
     for name, fname, fallback_rgb in ITEM_TEXTURES:
         item_tiles[name] = len(tiles)
         tiles.append(load_item_tex(fname) or solid(fallback_rgb))
+    for name, bottle, colour in POTION_TEXTURES:
+        item_tiles[name] = len(tiles)
+        tiles.append(potion_tex(bottle, colour) or
+                     solid(((colour >> 16) & 0xFF, (colour >> 8) & 0xFF, colour & 0xFF)))
 
     # Block-breaking crack overlay, one tile per destroy stage, contiguous.
     destroy_stage_tile = len(tiles)
@@ -806,6 +861,11 @@ def write_shape_table(ids, opaque, book_cover_tile, book_pages_tile, anvil_top_t
         f.write(" * flat item from a block. See source/items.h for the tools'\n")
         f.write(" * dig properties and block_props_gen.h for the drop tables. */\n")
         for name, _fname, _rgb in ITEM_TEXTURES:
+            f.write(f"#define ITEM_{name}_TILE {item_tiles[name]}\n")
+        f.write("\n/* Potions, one finished tile per effect: the bottle with the\n")
+        f.write(" * liquid already tinted in (see potion_tex). The proxy keys\n")
+        f.write(" * these on the stack's damage value, not its item id. */\n")
+        for name, _bottle, _colour in POTION_TEXTURES:
             f.write(f"#define ITEM_{name}_TILE {item_tiles[name]}\n")
         f.write("\n/* Block-breaking crack overlay: DESTROY_STAGE_TILE + stage,\n")
         f.write(" * stage in 0..DESTROY_STAGE_COUNT-1 (vanilla destroy_stage_N). */\n")

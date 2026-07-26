@@ -45,14 +45,32 @@
 #define ITEM_BED_TILE 689
 #define ITEM_COCOA_BEANS_TILE 690
 #define ITEM_NETHER_WART_TILE 691
+#define ITEM_BOW_TILE 692
+#define ITEM_ARROW_TILE 693
+#define ITEM_FISHING_ROD_TILE 694
+#define ITEM_GOLDEN_APPLE_TILE 695
+#define ITEM_WATER_BUCKET_TILE 696
+#define ITEM_LAVA_BUCKET_TILE 697
+#define ITEM_ENDER_PEARL_TILE 698
+#define ITEM_DIAMOND_HELMET_TILE 699
+#define ITEM_DIAMOND_CHESTPLATE_TILE 700
+#define ITEM_DIAMOND_LEGGINGS_TILE 701
+#define ITEM_DIAMOND_BOOTS_TILE 702
+
+/* Potions, one finished tile per effect: the bottle with the
+ * liquid already tinted in (see potion_tex). The proxy keys
+ * these on the stack's damage value, not its item id. */
+#define ITEM_SPLASH_SPEED_TILE 703
+#define ITEM_SPLASH_REGEN_TILE 704
+#define ITEM_FIRE_RESISTANCE_POTION_TILE 705
 
 /* Block-breaking crack overlay: DESTROY_STAGE_TILE + stage,
  * stage in 0..DESTROY_STAGE_COUNT-1 (vanilla destroy_stage_N). */
-#define DESTROY_STAGE_TILE 692
+#define DESTROY_STAGE_TILE 706
 #define DESTROY_STAGE_COUNT 10
 
 /* Total tiles packed into the atlas (block tiles + face
  * overrides + the extras above); an id/tile past this is a bug. */
-#define NUM_ATLAS_TILES 702
+#define NUM_ATLAS_TILES 716
 
 #endif

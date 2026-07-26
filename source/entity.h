@@ -112,6 +112,43 @@ void Entity_TickAll(EntityWorld *ew);
 
 u32  Entity_Count(const EntityWorld *ew);
 
+/* ---- targeting (T18) ----------------------------------------------------
+ * Minecraft.getMouseOver's entity pass. The block trace runs first and
+ * unchanged; this then asks whether anything hittable lies in front of
+ * whatever the blocks stopped at.
+ *
+ * Reach is deliberately shorter than the block reach -- 3.0 against 4.5 -- and
+ * the two are separate numbers in vanilla for a reason: a crosshair that
+ * targets a player five blocks away sends an attack the server rejects. */
+#define REACH_ENTITY 3.0
+
+typedef struct {
+	int    slot;             /* index into EntityWorld.e[]               */
+	s32    eid;
+	double t;                /* distance along the look vector, blocks   */
+	double hx, hy, hz;       /* the intercept, in local block units      */
+} EntityHit;
+
+/* getCollisionBorderSize: every entity's box grows by this per side for
+ * picking, so a player's 0.6 x 1.8 is targeted as 0.8 x 2.0. */
+#define ENTITY_PICK_EXPAND 0.1
+
+/* Trace from (ex,ey,ez) along the unit vector (lx,ly,lz) out to `maxDist`.
+ * `blockT` is how far away the block trace hit (or maxDist when it missed) --
+ * an entity only wins if it is strictly closer, which is what makes a player
+ * standing against a wall targetable and one standing behind it not.
+ *
+ * Only entities the server will accept an attack against are considered:
+ * dropped items, xp orbs, arrows, snowballs, pearls, potions and fishing
+ * bobbers are never targets, because C02 ATTACK against one of them is a
+ * *kick* ("Attempting to attack an invalid entity"), not a no-op.
+ *
+ * Returns 1 and fills `out` on a hit. */
+int Entity_RayTrace(const EntityWorld *ew, double ex, double ey, double ez,
+                    double lx, double ly, double lz,
+                    double maxDist, double blockT, s32 excludeEid,
+                    EntityHit *out);
+
 /* ---- rendering ---------------------------------------------------------- */
 
 /* One-time GX setup: the entity vertex format (GX_VTXFMT3 -- 0/1/2 are world,

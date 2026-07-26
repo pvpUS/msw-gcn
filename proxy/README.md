@@ -31,9 +31,13 @@ into it — with no server, no account and no game in progress — is what makes
 that loop bearable. `--loop` and `--speed` are there too.
 
 Anything typed at a running proxy is said by the account, so getting it out of
-the hub and onto a map is `/join hontori`. Without that there is no map, and
-without a map the console has nothing to show — composing commands on the pad
-is **T23**, two milestones away. Only active when stdin is a terminal.
+the hub and onto a map is `/join hontori`. The console can compose the same
+commands itself now (D-pad Up opens the palette), so this is a convenience
+rather than the only way in. Only active when stdin is a terminal.
+
+`--replay` also decodes what the *console* sends and prints a summary once a
+second — the MOVE rate, the last position, the flag bits and the teleport
+epoch. That is how the outbound path gets checked without a live server.
 
 Point the console at it by setting `NET_PROXY_IP` in
 [`../source/main.c`](../source/main.c); the proxy prints the addresses it is
@@ -51,9 +55,10 @@ reachable on at startup.
 | `entities.js` | the entity stream, filtered by type and capped at 128 nearest |
 | `chat.js` | 1.8 chat components → 95 printable glyphs and one colour byte |
 | `state.js` | health, inventory, held slot, XP, game mode, teleports, outbound chat |
+| `netplayer.js` | the console's intent → 1.8 packets: movement selection, the `C0B` edges, dig/place, attack ordering and the `C02` filter |
 | `blockmap.js` | 1.8 state ids ↔ engine global ids |
 | `stub.js` | a GCLink server that does nothing but the handshake — the known-good other end to bisect against when this one misbehaves |
-| `selftest.js` | 563 checks, no server and no console required |
+| `selftest.js` | 668 checks, no server and no console required |
 
 `blockmap.json` and `mapdb.json` are generated — do not edit them:
 
@@ -68,12 +73,25 @@ build height at its recorded origin, and no two maps overlap. It reports the
 margin — currently the closest two origins are 1724 blocks apart and the
 furthest any scan reaches from its own origin is 175.
 
-## Not here yet
+## The outbound path
 
-Movement, digging, placing and attacking are **T22**, and the plan is explicit
-that landing half of that gets the account kicked within seconds with a failure
-mode that is very hard to see from the console. `index.js` logs and drops those
-messages. Three pieces of the 1.8 conformance table are implemented anyway,
-because a proxy that cannot hold a session cannot be tested at all and none of
-them is movement: the `C06` reply to `S08` (which echoes the *server's*
-coordinates), the teleport epoch, and `C15`/`C17` on join.
+`netplayer.js` is the riskiest file here, and the risk is not that it crashes.
+Every item on the 1.8 conformance list, left out, produces either a kick or a
+*silent drop* — the console goes on playing, the server ignores it, and nothing
+anywhere says so:
+
+| | |
+|---|---|
+| `C0B` sprint/sneak edges | server-side sprint is driven entirely by these. Sprint without them and you get "moved too quickly" **and** no sprint knockback. |
+| the sprint-reset asymmetry | after an attack the server silently clears its own sprint flag; vanilla never re-sends `START_SPRINTING`, so neither does this. |
+| `S08` → `C06` | echoes the **server's** coordinates. Until that lands, `hasMoved` stays false and every later packet is discarded. |
+| the teleport epoch | `MOVE`s in flight across an `S08` describe a place the player no longer is; they are dropped. |
+| packet selection | `C03`/`C04`/`C05`/`C06` by what actually changed, Y as the AABB's `minY`. |
+| attack ordering | `C09` → `C0A` → `C02`: the server computes damage from *its* held item. |
+| the `C02` filter | attacking an item or an arrow is a kick, not a no-op. |
+| `C0F` auto-ack | miss one `S32` and the server ignores every later window click. |
+| `C15` / `C17` on join | plugins read `player.getLocale()`; a client with no brand looks like a bot. |
+
+`selftest.js` asserts every row of that table against fakes, so a regression
+shows up in a second rather than as an account that quietly stops being able to
+place blocks.

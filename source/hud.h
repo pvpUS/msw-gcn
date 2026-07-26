@@ -44,6 +44,14 @@ HudScreen Hud_Screen(int fbWidth, int efbHeight);
  * caller must reload the perspective projection before the next World_Draw. */
 void Hud_End2D(void);
 
+/* A filled gui-space panel, for anything that needs a backdrop under text --
+ * the chat log, the command palette. `rgba` is 0xRRGGBBAA and alpha blends.
+ *
+ * Draw panels *before* any Hud_DrawString in the same pass: the text calls
+ * leave the font bound and the TEV stage in modulate mode, so a flat quad
+ * drawn after one would come out textured. */
+void Hud_DrawPanel(float x, float y, float w, float h, u32 rgba);
+
 /* ---- text (FontRenderer) ------------------------------------------------
  * Minecraft 1.8.9's ascii.png, baked to an I4 texture (data/font.tpl) with
  * vanilla's variable glyph advances (source/font_gen.h). Draws in gui space

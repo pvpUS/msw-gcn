@@ -20,10 +20,12 @@
 void HeldItem_InitGX(void);
 
 /* Draw the held item for `p`. fbWidth/efbHeight are the current EFB dimensions
- * (the same values passed to GX_SetViewport). No-op when the held slot is
- * empty. Leaves the GX viewport depth range restored to [0,1]; the following
- * Hud_Draw sets up all of its own remaining state. */
-void HeldItem_Draw(Player *p, int fbWidth, int efbHeight);
+ * (the same values passed to GX_SetViewport) and `alpha` the inter-tick
+ * fraction, so the walk bob and the swing arc run at the video rate off state
+ * that ticks at 20 Hz. No-op when the held slot is empty. Leaves the GX
+ * viewport depth range restored to [0,1]; the following Hud_Draw sets up all of
+ * its own remaining state. */
+void HeldItem_Draw(const Player *p, int fbWidth, int efbHeight, float alpha);
 
 /* ---- shared item geometry (also used for dropped items in the world) -----
  * entityitem.c renders EntityItems out of the same two meshes, just with a

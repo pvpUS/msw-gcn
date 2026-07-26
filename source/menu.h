@@ -6,7 +6,7 @@
 
 /* Menu_Run's out-of-band results. Anything >= 0 is a map index. */
 #define MENU_QUIT    (-1)
-#define MENU_NETWORK (-2)   /* connect to the proxy and spectate (T11) */
+#define MENU_NETWORK (-2)   /* connect to the proxy and play (T11/T22) */
 
 /* Runs the map-selection menu using the libogc console on `xfb`.
  * `netTarget` is the proxy address the network entry will dial, shown so the

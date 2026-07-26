@@ -69,7 +69,10 @@ ITEM_MAP = {
     322: "GOLDEN_APPLE",
     326: "WATER_BUCKET",
     327: "LAVA_BUCKET",
-    332: "SNOW_BALL",
+    # Bukkit calls it SNOW_BALL; the atlas tile has been ITEM_SNOWBALL_TILE
+    # since long before this table, and it is also a snow-block drop, so the
+    # tile keeps its name rather than churning block_props_gen.h.
+    332: "SNOWBALL",
     368: "ENDER_PEARL",
     310: "DIAMOND_HELMET",
     311: "DIAMOND_CHESTPLATE",

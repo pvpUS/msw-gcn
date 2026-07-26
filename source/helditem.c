@@ -141,20 +141,31 @@ void HeldItem_SetupGX(void) {
 	GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
 }
 
-void HeldItem_Draw(Player *p, int fbWidth, int efbHeight) {
-	ItemStack *s = Inventory_GetCurrentItem(&p->inventory);
+void HeldItem_Draw(const Player *p, int fbWidth, int efbHeight, float alpha) {
+	ItemStack *s = Inventory_GetCurrentItem((Inventory *)&p->inventory);
 	if (!s || s->item < 0) return;          /* empty hand -> draw nothing */
 	int item = s->item;
 
 	/* Gentle view-bob: a small figure-eight sway that grows with walk speed and
 	 * settles to zero at rest (so a static screenshot shows the neutral pose).
-	 * Phase is kept here since this is the only per-frame hook the item has. */
-	static float phase = 0.0f;
-	float speed = (float)sqrt(p->motionX * p->motionX + p->motionZ * p->motionZ);
-	float amp = speed * 7.0f; if (amp > 1.0f) amp = 1.0f;
-	phase += 0.15f + amp * 0.5f;
+	 * The phase lives on the Pose and advances at the tick rate; this reads it
+	 * interpolated, so the sway no longer depends on the frame time. */
+	float phase = Pose_Bob(&p->pose, alpha);
+	float amp = p->pose.prevLimbSwingAmount +
+	            (p->pose.limbSwingAmount - p->pose.prevLimbSwingAmount) * alpha;
 	float bobX =  sinf(phase)        * 0.025f * amp;
 	float bobY = -fabsf(cosf(phase)) * 0.030f * amp;
+
+	/* ItemRenderer.transformFirstPersonItem's swing arc, on top of this
+	 * engine's own resting placement. `f` peaks late and `f1` early, which is
+	 * what gives the motion its snap: the item whips down and across, then
+	 * eases back over the remainder of the six ticks. */
+	float sw = Pose_SwingProgress(&p->pose, alpha);
+	float f  = sinf(sw * sw * (float)M_PI);
+	float f1 = sinf(sqrtf(sw) * (float)M_PI);
+	float swingYaw   = f  * -20.0f;
+	float swingRoll  = f1 * -20.0f;
+	float swingPitch = f1 * -80.0f;
 
 	/* ---- GX state: a small 3D overlay drawn on top of the world ---- */
 	HeldItem_SetupGX();
@@ -168,11 +179,13 @@ void HeldItem_Draw(Player *p, int fbWidth, int efbHeight) {
 
 	Mtx mv;
 	if (item < NUM_BLOCK_IDS) {
-		build_mv(mv, HB_X + bobX, HB_Y + bobY, HB_Z, HB_PITCH, HB_YAW, 0.0f, HB_SCALE);
+		build_mv(mv, HB_X + bobX, HB_Y + bobY, HB_Z,
+		         HB_PITCH + swingPitch, HB_YAW + swingYaw, swingRoll, HB_SCALE);
 		GX_LoadPosMtxImm(mv, GX_PNMTX0);
 		HeldItem_DrawBlockMesh(item);
 	} else {
-		build_mv(mv, HI_X + bobX, HI_Y + bobY, HI_Z, 0.0f, HI_YAW, HI_ROLL, HI_SCALE);
+		build_mv(mv, HI_X + bobX, HI_Y + bobY, HI_Z,
+		         swingPitch, HI_YAW + swingYaw, HI_ROLL + swingRoll, HI_SCALE);
 		GX_LoadPosMtxImm(mv, GX_PNMTX0);
 		HeldItem_DrawFlatMesh(item);
 	}

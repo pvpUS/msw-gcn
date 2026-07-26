@@ -30,6 +30,7 @@ const mapdbMod = require('./mapdb');
 const { WorldTranslator } = require('./world');
 const { EntityTranslator } = require('./entities');
 const { StateTranslator } = require('./state');
+const { NetPlayer } = require('./netplayer');
 
 const TICK_MS = 50;           // 20 Hz, the server's tick and the console's
 const AUTH = 'microsoft';     // not configurable -- see loadConfig()
@@ -140,6 +141,11 @@ async function main() {
             speed: Number(arg('speed', 1)), loop: has('loop'), log,
         });
         link.on('attach', () => log.info('console attached -- replaying'));
+        // A replay has no server to send anything to, but the console is still
+        // talking, and what it says is most of what there is to get wrong.
+        // Decoding it here is how the outbound path (T22) gets checked without
+        // an account, a server or a game in progress.
+        installConsoleMonitor(link, log);
         installShutdown({ link, recorder, log });
         return;
     }
@@ -158,9 +164,14 @@ async function main() {
         isSolid: (x, y, z) => world.solidAt(x, y, z),
     });
 
-    world.on('map', (m) => { state.setMap(m); entities.setMap(m); });
-    world.on('lobby', () => { state.setMap(null); entities.setMap(null); });
+    // Console -> server. Everything the pad does becomes a 1.8 packet here,
+    // and nowhere else.
+    const player = new NetPlayer({ link, state, entities, log });
+
+    world.on('map', (m) => { state.setMap(m); entities.setMap(m); player.setMap(m); });
+    world.on('lobby', () => { state.setMap(null); entities.setMap(null); player.setMap(null); });
     state.on('position', (x, y, z) => world.onPosition(x, y, z));
+    state.on('teleport', () => player.onTeleported());
 
     link.on('attach', () => {
         // Order matters: the console needs the map before the blocks that
@@ -169,7 +180,9 @@ async function main() {
         state.onConsoleAttached();
         entities.onConsoleAttached();
     });
-    link.on('message', (type, payload) => onConsoleMessage(type, payload, { state, log }));
+    link.on('detach', () => player.onConsoleDetached());
+    link.on('message', (type, payload) =>
+        onConsoleMessage(type, payload, { player, log }));
 
     // Once, not per reconnect: an SRV record that has just changed is not the
     // failure this is here to survive, and a resolver round trip on every
@@ -179,7 +192,7 @@ async function main() {
     config.server.port = addr.port;
 
     const session = { client: null, closing: false, attempts: 0 };
-    connect(session, { config, log, link, state, world, entities });
+    connect(session, { config, log, link, state, world, entities, player });
 
     const tick = setInterval(() => {
         world.flush();
@@ -187,7 +200,7 @@ async function main() {
     }, TICK_MS);
 
     const stats = setInterval(() => {
-        log.info(`${world.report()} | ${entities.report()} | ` +
+        log.info(`${world.report()} | ${entities.report()} | ${player.report()} | ` +
                  `console ${link.attached ? `rtt ${link.rttMs} ms` : 'detached'}, ` +
                  `${(link.bytesOut / 1024).toFixed(0)} KB out`);
     }, 30000);
@@ -196,6 +209,46 @@ async function main() {
 
     installShutdown({ link, recorder, log, blockmap, world, entities, state, session,
                       timers: [tick, stats] });
+}
+
+/**
+ * What is the console saying, during a replay?
+ *
+ * Tallies every console -> proxy frame and decodes the MOVE, which is the one
+ * whose layout has thirty-four bytes to get wrong and whose failure mode --
+ * a sign flip in the yaw, a stale epoch, the wrong Y -- is invisible on the
+ * console itself. Prints once a second while anything is arriving.
+ */
+function installConsoleMonitor(link, log) {
+    const counts = new Map();
+    let last = null;
+
+    link.on('message', (type, payload) => {
+        counts.set(type, (counts.get(type) || 0) + 1);
+        if (type === C.MOVE && payload.length >= 34) {
+            last = {
+                x: payload.readDoubleBE(0), y: payload.readDoubleBE(8),
+                z: payload.readDoubleBE(16),
+                yaw: payload.readFloatBE(24), pitch: payload.readFloatBE(28),
+                flags: payload.readUInt8(32), epoch: payload.readUInt8(33),
+            };
+        }
+    });
+
+    const timer = setInterval(() => {
+        if (!counts.size) return;
+        const parts = [...counts.entries()]
+            .sort((a, b) => b[1] - a[1])
+            .map(([t, n]) => `${typeName(t).replace(/^C_/, '')} x${n}`);
+        const m = last
+            ? ` | at ${last.x.toFixed(2)}, ${last.y.toFixed(2)}, ` +
+              `${last.z.toFixed(2)} yaw ${last.yaw.toFixed(1)} ` +
+              `flags 0x${last.flags.toString(16)} epoch ${last.epoch}`
+            : '';
+        log.info(`console -> ${parts.join(', ')}${m}`);
+        counts.clear();
+    }, 1000);
+    timer.unref?.();
 }
 
 /**
@@ -275,7 +328,7 @@ async function resolveServer(host, port, log) {
 
 // ---- the Minecraft side ------------------------------------------------------
 function connect(session, ctx) {
-    const { config, log, link, state, world, entities } = ctx;
+    const { config, log, link, state, world, entities, player } = ctx;
     const mc = require('minecraft-protocol');
 
     const opts = {
@@ -303,6 +356,7 @@ function connect(session, ctx) {
     const client = mc.createClient(opts);
     session.client = client;
     state.attach(client);
+    player.attach(client);
 
     client.on('login', (pkt) => {
         session.attempts = 0;
@@ -357,6 +411,9 @@ function connect(session, ctx) {
     on('set_slot', (p) => state.onSetSlot(p));
     on('window_items', (p) => state.onWindowItems(p));
     on('chat', (p) => state.onChat(p));
+    // S32. Every one has to be acked or the server stops honouring window
+    // clicks entirely -- silently, and for the rest of the session.
+    on('transaction', (p) => player.onTransaction(p));
     on('entity_velocity', (p) => {
         if (p.entityId === state.selfEid) state.onSelfVelocity(p);
         else entities.onVelocity(p);
@@ -386,21 +443,18 @@ function connect(session, ctx) {
 
 // ---- the console side --------------------------------------------------------
 /**
- * Console -> server. Only CHAT is wired up here: movement, digging, placing and
- * attacking are T22's, and the plan is explicit that landing half of that gets
- * the account kicked within seconds with a failure mode that is very hard to
- * see from the console. Anything else is logged once and dropped.
+ * Console -> server. netplayer.js owns the whole translation; this is only the
+ * dispatch, and the one thing it adds is a single warning per unrecognised
+ * type so a link that has grown a message this proxy does not know about says
+ * so once rather than either silently or twenty times a second.
  */
-function onConsoleMessage(type, payload, { state, log }) {
-    if (type === C.CHAT) {
-        state.say(payload.toString('ascii'));
-        return;
-    }
+function onConsoleMessage(type, payload, { player, log }) {
+    if (player.onMessage(type, payload) !== false) return;
     if (!onConsoleMessage.seen) onConsoleMessage.seen = new Set();
     if (!onConsoleMessage.seen.has(type)) {
         onConsoleMessage.seen.add(type);
         log.warn(`console sent ${typeName(type)} (${payload.length} B) -- ` +
-                 `no handler yet, that is T22's`);
+                 `no handler for it`);
     }
 }
 

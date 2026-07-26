@@ -383,6 +383,12 @@ void Hud_End2D(void) {
 	GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
 }
 
+void Hud_DrawPanel(float x, float y, float w, float h, u32 rgba) {
+	tev_flat();
+	rect(x, y, w, h, (u8)(rgba >> 24), (u8)(rgba >> 16), (u8)(rgba >> 8),
+	     (u8)rgba);
+}
+
 void Hud_Draw(Player *p, int fbWidth, int efbHeight, int invOpen, int cursorSlot) {
 	Inventory *inv = &p->inventory;
 
@@ -657,12 +663,16 @@ void Hud_DrawNetOverlay(const HudNet *n, int fbWidth, int efbHeight) {
 
 	/* Spectator banner. The plugin cancels lethal damage and drops you into
 	 * spectator instead of killing you (T26), so this is the only signal that
-	 * anything happened -- there is no death screen to wait for. */
+	 * anything happened -- there is no death screen to wait for.
+	 *
+	 * Drawn where the hotbar was, which in spectator is empty screen: at the
+	 * top it would sit under the perf overlay's nine lines, and the one line
+	 * that says "you are dead" is a poor thing to have to read around. */
 	if (n->gameMode == 3) {
 		static const char *SPEC = "SPECTATING";
 		run[nr].s = SPEC;
 		run[nr].x = (int)(gw / 2) - Hud_StringWidth(SPEC) / 2;
-		run[nr].y = 12;
+		run[nr].y = (int)gh - 24;
 		run[nr].rgba = 0xAAAAAAFFu;
 		nr++;
 	}

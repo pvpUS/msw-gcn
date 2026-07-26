@@ -5,12 +5,27 @@ map scans, selectable from an in-game menu and textured from a resource pack.
 Built with [devkitPPC + libogc](https://devkitpro.org/) (GX for rendering).
 
 At boot you get a **main menu** listing every embedded map with its block count.
-Pick one and it decompresses on the console and builds the world; fly around and
-press Start to return to the menu.
+Pick one and it decompresses on the console and builds the world; walk around,
+mine and build, and press Start to return to the menu. **Y** instead dials the
+Node proxy (`proxy/`) and plays a live MegaSkywars game over the Broadband
+Adapter.
 
-Controls:
-- **Menu:** D-Pad / main stick to move the selection, **A** to load, **Start** to quit.
-- **In a world:** main stick to fly forward/strafe, C-stick to look, **A/B** to rise/fall, **Start** back to the menu.
+Controls — the pad has no spare inputs, so this is all of them:
+
+| | |
+|---|---|
+| Menu | D-Pad / stick to move, **A** load, **Y** play online, **Start** quit |
+| Move / look | main stick, C-stick |
+| **L** | mine / attack |
+| **Y** | place / use |
+| **R** | sprint |
+| **A** / **B** | jump / sneak (confirm / cancel in a menu) |
+| **X** | inventory screen |
+| D-Pad ◀ ▶ | held hotbar slot |
+| D-Pad ▲ | command palette (`/join`, `/team`, `/start`, canned chat) |
+| D-Pad ▼ | drop item — offline, the perf overlay |
+| **Z** | hold to show the chat log |
+| **Start** | back to the menu, or the pause menu online |
 
 ## World format & compression
 

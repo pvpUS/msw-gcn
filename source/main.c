@@ -18,11 +18,15 @@
 
 #include "camera.h"
 #include "player.h"
+#include "input.h"
 #include "world.h"
 #include "hud.h"
 #include "helditem.h"
 #include "entityitem.h"
 #include "interact.h"
+#include "combat.h"
+#include "cmdmenu.h"
+#include "items.h"        /* Block_IsLiquid, for the fluid self-test */
 #include "net.h"
 #include "netgame.h"
 #include "entity.h"
@@ -41,10 +45,6 @@
  * hands just mine slowly and stone-type blocks drop nothing, exactly as in
  * Minecraft. Block ids are 0-based global ids (== _blockids.txt line - 1). */
 #define HUD_DEMO_ITEMS 1
-
-/* Analog trigger threshold for the mine/place buttons (the digital click at
- * the bottom of the travel also counts). */
-#define TRIGGER_THRESHOLD 60
 
 static void *xfb[2] = {NULL, NULL};
 static GXRModeObj *rmode;
@@ -76,9 +76,29 @@ static Mtx44 g_proj;
  * controller input in this setup (see the project's testing notes), so this
  * aims the player down at the ground and holds mine, then place, on a fixed
  * frame schedule -- enough to screenshot the whole break -> drop -> pickup ->
- * place loop with an empty controller. Leave at 0 for normal play; pair with
- * TEST_AUTOLOAD to skip the menu. */
+ * place loop with an empty controller.
+ *
+ * Since T16 this is a *synthetic PlayerInput* rather than a set of overrides
+ * scattered through the loop, which is the point of having the struct: the
+ * physics and the interaction code cannot tell it from a pad. Leave at 0 for
+ * normal play; pair with TEST_AUTOLOAD to skip the menu. */
 #define INTERACT_TEST_MODE 0
+
+/* Fluid self-test (T21's "done when"). Finds the deepest water column in the
+ * loaded map, drops the player thirty blocks onto it, and then holds jump --
+ * which is the whole of what T21 changed, in the order it matters:
+ *
+ *   1. the player must *sink into* the water rather than stand on it. Standing
+ *      on it is what reads to the server as hovering, and eighty ticks of that
+ *      is the "Flying is not enabled" kick;
+ *   2. the fall must do zero damage, because fallDistance is zeroed every tick
+ *      spent in a fluid -- that is what makes an MLG water bucket work;
+ *   3. jump held must swim back up at 0.04 a tick rather than do nothing.
+ *
+ * The readout underneath reports all three, so a screenshot is the check.
+ * Pair with TEST_AUTOLOAD (aqueduct, index 1, has the most water of any
+ * shipped map). Leave at 0 for normal play. */
+#define FLUID_TEST_MODE 0
 
 /* Dirty chunks World_FlushRemesh (T24) may re-mesh per rendered frame. A
  * ceiling, not a quota: the flush also stops on its own wall-clock budget, so
@@ -354,9 +374,94 @@ static u32 CountEntities(const ItemWorld *iw) {
 	return n;
 }
 
+/* Consume the UI edges a frame has already acted on.
+ *
+ * Edges accumulate in the PlayerInput until something takes them, because at
+ * 60 Hz video and 20 Hz ticks two frames in three run no tick and a press
+ * latched on one of those must survive to the next. That is exactly right for
+ * the gameplay edges the tick reads -- and exactly wrong for the ones the
+ * *frame* reads, which would otherwise fire again next frame and toggle the
+ * inventory twice. So the frame clears its own. */
+static void ConsumeUiEdges(PlayerInput *in) {
+	in->menu = in->openInv = in->dropItem = in->pause = 0;
+	in->confirm = in->cancel = in->debug = 0;
+	in->navX = in->navY = 0;
+	in->hotbarDelta = 0;
+}
+
+#if FLUID_TEST_MODE
+/* Deepest water column in the map: the one worth dropping into, because a
+ * single surface block would be ambiguous between "sank in" and "clipped
+ * through". Returns 0 if the map has no water at all. */
+static int FindWaterColumn(const World *w, int *ox, int *oy, int *oz) {
+	int best = 0, bx, by, bz;
+	for (bx = w->minx; bx < w->minx + (int)w->dimx; bx++)
+		for (bz = w->minz; bz < w->minz + (int)w->dimz; bz++) {
+			int run = 0;
+			for (by = w->miny; by < w->miny + (int)w->dimy; by++) {
+				int id = World_GetBlock(w, bx, by, bz);
+				if (id >= 0 && Block_IsLiquid(id)) {
+					if (++run > best) {
+						best = run;
+						*ox = bx; *oy = by; *oz = bz;   /* the top of the run */
+					}
+				} else {
+					run = 0;
+				}
+			}
+		}
+	return best;
+}
+
+/* Drop, then hold jump. 60 ticks is plenty for a thirty-block fall (about 40)
+ * and the swim afterwards is where the ledge bump and the 0.04 lift show. */
+static void FluidTestInput(PlayerInput *in, int tick) {
+	Input_Clear(in);
+	in->jump = (u8)(tick > 60);
+}
+
+static void FluidTestReport(int fbWidth, int efbHeight, const Player *p,
+                            int depth, double startY) {
+	char line[80];
+	Hud_Begin2D(fbWidth, efbHeight);
+	snprintf(line, sizeof line, "fluid: water %d deep, dropped from %d",
+	         depth, (int)startY);
+	Hud_DrawStringShadow(line, 2, 9 * 8 + 6, 0xFFFFFFFFu);
+	snprintf(line, sizeof line, "y %d.%02d  inWater %d  onGround %d  fall %d.%01d",
+	         (int)p->y, (int)((p->y - floor(p->y)) * 100.0),
+	         p->inWater, p->onGround,
+	         (int)p->fallDistance, ((int)(p->fallDistance * 10.0f)) % 10);
+	Hud_DrawStringShadow(line, 2, 9 * 9 + 6, 0xFFFFFFFFu);
+	snprintf(line, sizeof line, "health %d.%01d / 20   %s",
+	         (int)p->health, ((int)(p->health * 10.0f)) % 10,
+	         p->health >= 20.0f ? "no fall damage - PASS" : "TOOK DAMAGE");
+	Hud_DrawStringShadow(line, 2, 9 * 10 + 6,
+	                     p->health >= 20.0f ? 0x55FF55FFu : 0xFF5555FFu);
+	Hud_End2D();
+}
+#endif
+
+#if INTERACT_TEST_MODE
+/* Repeating cycle so any screenshot lands somewhere useful: 0-119 settle and
+ * aim down, 120-479 mine with the pickaxe, 480-839 place cobblestone, then
+ * start over. Written straight into a PlayerInput, so nothing downstream knows
+ * it is not a pad. */
+static void ScriptedInput(PlayerInput *in, Player *player, int frame) {
+	Input_Clear(in);
+	if (frame == 120) player->pitch = -50.0f;
+	if (frame < 120) return;
+	int phase = ((frame - 120) / 360) % 2;
+	player->inventory.currentItem = phase ? 5 : 0;
+	in->attackHeld = (u8)(phase == 0);
+	in->useHeld    = (u8)(phase == 1);
+	if (phase == 0 && ((frame - 120) % 360) == 0) in->attackEdge = 1;
+}
+#endif
+
 static void RunWorld(World *w, u32 curr) {
 	Mtx v;
 	Player player;
+	PlayerInput in, act;
 	Camera cam;    /* debug free-fly camera (toggled with Z) */
 	Interact interact;   /* block breaking/placing (PlayerControllerMP port) */
 	ItemWorld items;     /* loose EntityItem drops                           */
@@ -371,11 +476,16 @@ static void RunWorld(World *w, u32 curr) {
 #if INTERACT_TEST_MODE
 	int testFrame = 0;
 #endif
+#if FLUID_TEST_MODE
+	int fluidTick = 0, fluidDepth = 0, fwx = 0, fwy = 0, fwz = 0;
+	double fluidStartY = 0.0;
+#endif
 #if REMESH_BURST_TEST
 	int burstFrame = 0;
 #endif
 
 	Player_Spawn(&player, w);
+	Input_Init(&in);
 	Interact_Init(&interact);
 	ItemWorld_Init(&items);
 	Hud_PerfInit(&perf);
@@ -387,40 +497,31 @@ static void RunWorld(World *w, u32 curr) {
 		freecam = 1;
 		SetTourCamera(&cam, tourIdx);
 	}
+#if FLUID_TEST_MODE
+	fluidDepth = FindWaterColumn(w, &fwx, &fwy, &fwz);
+	if (fluidDepth) {
+		Player_Teleport(&player, fwx + 0.5, fwy + 31.0, fwz + 0.5, 0.0f, -20.0f);
+		fluidStartY = player.y;
+	}
+#endif
 
 	u64 prevTB = gettime();
 	double accum = 0.0;
 
 	while (SYS_MainLoop()) {
 		PAD_ScanPads();
-		u32 down = PAD_ButtonsDown(0);
-		u32 held = PAD_ButtonsHeld(0);
-		if (down & PAD_BUTTON_START) break;
-
-		/* Mine (left mouse) on L, place/use (right mouse) on Y. L is analog,
-		 * so either a firm pull or the digital click at the bottom counts. */
-		int attackHeld = (held & PAD_TRIGGER_L) != 0 ||
-		                 PAD_TriggerL(0) > TRIGGER_THRESHOLD;
-		int useHeld    = (held & PAD_BUTTON_Y) != 0;
-
+		Input_Sample(&in, 0);
 #if INTERACT_TEST_MODE
-		/* Repeating cycle so any screenshot lands somewhere useful:
-		 * 0-119 settle and aim down, 120-479 mine with the pickaxe,
-		 * 480-839 place cobblestone, then start over. */
-		testFrame++;
-		if (testFrame == 120) player.pitch = -50.0f;
-		int phase = (testFrame < 120) ? 0 : ((testFrame - 120) / 360) % 2;
-		if (testFrame >= 120) player.inventory.currentItem = phase ? 5 : 0;
-		attackHeld = (testFrame >= 120 && phase == 0);
-		useHeld    = (testFrame >= 120 && phase == 1);
+		ScriptedInput(&in, &player, ++testFrame);
 #endif
+		if (in.pause) break;
 
 		/* X toggles the inventory screen. Closed: D-pad L/R scrolls the held
 		 * hotbar slot (changeCurrentItem: +1 = left, -1 = right). Open: the
 		 * D-pad drives the slot cursor and A/B stand in for the left/right
-		 * mouse buttons (movement input is frozen while it's up, so borrowing
-		 * jump/sneak is free). */
-		if (down & PAD_BUTTON_X) {
+		 * mouse buttons (movement input is gated off while it's up, so
+		 * borrowing jump/sneak is free). */
+		if (in.openInv) {
 			invOpen = !invOpen;
 			/* Container.onContainerClosed: a stack still on the cursor when
 			 * the screen closes is thrown into the world. */
@@ -433,34 +534,34 @@ static void RunWorld(World *w, u32 curr) {
 			}
 		}
 		if (!invOpen) {
-			if (down & PAD_BUTTON_LEFT)  Inventory_ChangeCurrentItem(&player.inventory,  1);
-			if (down & PAD_BUTTON_RIGHT) Inventory_ChangeCurrentItem(&player.inventory, -1);
-			/* Perf overlay toggle. T16's button map reclaims D-pad Down for
-			 * drop-item; move this then. */
-			if (down & PAD_BUTTON_DOWN) {
+			if (in.hotbarDelta)
+				Inventory_ChangeCurrentItem(&player.inventory, in.hotbarDelta);
+			/* Offline, D-pad Down is still the perf toggle: nothing here drops
+			 * items, and the pause menu that owns the toggle in network mode
+			 * (T23) has no offline counterpart. */
+			if (in.dropItem) {
 				perfOn = !perfOn;
 				if (perfOn) { Hud_PerfInit(&perf); World_ResetStatsMax(w); }
 			}
 		} else {
-			if (down & PAD_BUTTON_LEFT)  invCursor = InvCursorMove(invCursor, -1,  0);
-			if (down & PAD_BUTTON_RIGHT) invCursor = InvCursorMove(invCursor,  1,  0);
-			if (down & PAD_BUTTON_UP)    invCursor = InvCursorMove(invCursor,  0, -1);
-			if (down & PAD_BUTTON_DOWN)  invCursor = InvCursorMove(invCursor,  0,  1);
-			if (down & PAD_BUTTON_A) Inventory_SlotClick(&player.inventory, invCursor, 0);
-			if (down & PAD_BUTTON_B) Inventory_SlotClick(&player.inventory, invCursor, 1);
+			if (in.navX) invCursor = InvCursorMove(invCursor, in.navX, 0);
+			if (in.navY) invCursor = InvCursorMove(invCursor, 0, in.navY);
+			if (in.confirm) Inventory_SlotClick(&player.inventory, invCursor, 0);
+			if (in.cancel)  Inventory_SlotClick(&player.inventory, invCursor, 1);
 		}
 
-		if (down & PAD_TRIGGER_Z) {
+		if (in.debug) {
 			freecam = !freecam;
 			if (freecam) {
 				/* start the debug camera at the player's eye */
 				Camera_Init(&cam,
 				            (float)(player.x * WORLD_BLOCK_SIZE),
-				            (float)((player.y + 1.62) * WORLD_BLOCK_SIZE),
+				            (float)((player.y + PLAYER_EYE_HEIGHT) * WORLD_BLOCK_SIZE),
 				            (float)(player.z * WORLD_BLOCK_SIZE),
 				            player.yaw, player.pitch);
 			}
 		}
+		ConsumeUiEdges(&in);
 
 		if (MODEL_TEST_MODE && MODEL_TEST_ROW < 0 && ++tourFrame >= TOUR_HOLD_FRAMES) {
 			tourFrame = 0;
@@ -491,18 +592,32 @@ static void RunWorld(World *w, u32 curr) {
 			Camera_Update(&cam, 0);
 			Camera_GetViewMatrix(&cam, v);
 		} else {
-			if (!invOpen) Player_Look(&player, 0);   /* freeze the view when browsing */
+			/* Freeze the view when browsing. */
+			if (!invOpen) Player_Look(&player, in.dYaw, in.dPitch);
 			accum += dtUs;
 			if (accum > MAX_ACCUM_US) accum = MAX_ACCUM_US;
 			u64 tickTB = gettime();
+			/* The inventory screen gates control off by handing the tick a
+			 * cleared input rather than by a `frozen` flag threaded through the
+			 * physics -- gravity and friction still run, so the player settles
+			 * while browsing exactly as before. */
+			act = in;
+			if (invOpen) Input_Clear(&act);
 			while (accum >= TICK_US) {
+#if FLUID_TEST_MODE
+				if (fluidDepth) FluidTestInput(&act, ++fluidTick);
+#endif
 				/* Minecraft.runTick's order: the controller acts on the
 				 * targeted block first, then the player moves, then the
 				 * world's entities update. */
-				Interact_Tick(&interact, w, &player, &items,
-				              attackHeld, useHeld, invOpen);
-				Player_Tick(&player, w, 0, invOpen);
+				Interact_Tick(&interact, w, &player, &items, &act, NULL);
+				Player_Tick(&player, w, &act);
 				ItemWorld_Tick(&items, w, &player);
+				Input_Tick(&in);
+				/* A press fires on exactly one tick, however many frames it
+				 * spanned; the copy `act` is refreshed from `in` next frame. */
+				Input_ClearEdges(&in);
+				Input_ClearEdges(&act);
 				accum -= TICK_US;
 			}
 			tickUs = (double)ticks_to_microsecs(gettime() - tickTB);
@@ -558,7 +673,7 @@ static void RunWorld(World *w, u32 curr) {
 			/* First-person held item, on top of the world but under the HUD.
 			 * Hidden while the full inventory screen is open (like vanilla). */
 			if (!invOpen)
-				HeldItem_Draw(&player, rmode->fbWidth, rmode->efbHeight);
+				HeldItem_Draw(&player, rmode->fbWidth, rmode->efbHeight, alpha);
 			Hud_Draw(&player, rmode->fbWidth, rmode->efbHeight, invOpen, invCursor);
 		}
 
@@ -570,6 +685,11 @@ static void RunWorld(World *w, u32 curr) {
 #if REMESH_BURST_TEST
 		if (burstFrame >= 301)
 			RemeshBurstReport(rmode->fbWidth, rmode->efbHeight);
+#endif
+#if FLUID_TEST_MODE
+		if (fluidDepth)
+			FluidTestReport(rmode->fbWidth, rmode->efbHeight, &player,
+			                fluidDepth, fluidStartY);
 #endif
 		/* Draws nothing until the network has been brought up, so this costs
 		 * offline play a branch and gives network mode (T11) the indicator
@@ -588,16 +708,23 @@ static void RunWorld(World *w, u32 curr) {
 	}
 }
 
-/* ---- network mode (T11) --------------------------------------------------
- * Milestone 1: connect, load whichever map the server is running, and watch a
- * live game. The console draws and does not act -- no movement is sent, which
- * is the single decision that keeps this milestone free of the kick risk that
- * T22 exists to manage.
+/* ---- network mode (T11, then T22/T14/T19/T23/T26) ------------------------
+ * Milestone 2: connect, load whichever map the server is running, and *play*
+ * it. Same frame shape as the offline loop -- poll, tick, draw -- with three
+ * differences, all of them consequences of the server owning the game:
  *
- * The camera is camera.c's free-fly, parked on the proxy account's position
- * the first time the server teleports it. That is the right spectator camera
- * and it is already written; a first-person one would need the movement path
- * this milestone deliberately does not have. */
+ *   - the drain runs first, and the map it names is loaded before anything
+ *     that refers to it;
+ *   - the player is `serverDriven`, so fall damage, respawn and block drops
+ *     are not predicted locally. All three used to be predicted, and all three
+ *     would fight S06 UpdateHealth or duplicate every drop;
+ *   - every tick ends by telling the proxy what happened -- one MOVE, plus
+ *     whatever dig, place, swing or attack the same state machines produced
+ *     offline.
+ *
+ * Death is a game-mode change and nothing else on this server (the plugin
+ * cancels lethal damage), so there is no death screen to write and no respawn
+ * packet to send; spectator is a branch in the tick and a banner in the HUD. */
 
 /* Bring the Broadband Adapter up, on the libogc console so a DHCP failure is
  * readable rather than a black screen. if_config blocks for up to `retries`
@@ -631,20 +758,32 @@ static int NetBringUp(void) {
 
 static void RunNetwork(u32 curr) {
 	NetGame ng;
-	Camera  cam;
 	World   world;
-	HudPerf perf;
-	HudTag  tags[HUD_TAG_MAX];
-	Mtx     v;
+	Player  player;
+	PlayerInput in, act;
+	Interact  interact;
+	Combat    combat;
+	ItemWorld items;    /* stays empty: drops come from the server (T14) */
+	CmdMenu   cmd;
+	HudPerf   perf;
+	HudTag    tags[HUD_TAG_MAX];
+	Mtx       v;
 	int   haveWorld = 0;
-	int   camSeeded = 0;
 	int   perfOn = PERF_HUD;
+	int   tagsOn = 1;
+	int   invOpen = 0;
+	int   invCursor = 0;
 	float alpha = 0.0f;
 	NetState lastState = NET_DOWN;
 
 	NetGame_Init(&ng);
+	Input_Init(&in);
+	Interact_Init(&interact);
+	Combat_Init(&combat);
+	ItemWorld_Init(&items);
+	CmdMenu_Init(&cmd);
 	Hud_PerfInit(&perf);
-	Camera_Init(&cam, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+	memset(&player, 0, sizeof player);
 	Net_Connect(NET_PROXY_IP, GCLINK_PORT);
 
 	u64 prevTB = gettime();
@@ -652,21 +791,56 @@ static void RunNetwork(u32 curr) {
 
 	while (SYS_MainLoop()) {
 		PAD_ScanPads();
-		u32 down = PAD_ButtonsDown(0);
-		u32 held = PAD_ButtonsHeld(0);
-		if (down & PAD_BUTTON_START) break;
-		if (down & PAD_BUTTON_Y) Net_Reconnect();
-		if (down & PAD_BUTTON_DOWN) {
+		Input_Sample(&in, 0);
+
+		/* Start opens the palette, which doubles as the pause menu; it does
+		 * not leave network mode, because leaving is one of its entries and
+		 * dropping the link by reflex is not what the button should do
+		 * mid-game. */
+		if (in.pause && !cmd.open) { in.pause = 0; in.menu = 1; }
+		int menuFocus = CmdMenu_Update(&cmd, &in);
+
+		const char *say = CmdMenu_TakeChat(&cmd);
+		if (say) NetGame_SendChat(&ng, say);
+		int quit = 0;
+		switch (CmdMenu_TakeAction(&cmd)) {
+		case CMDMENU_ACT_DISCONNECT: quit = 1; break;
+		case CMDMENU_ACT_RECONNECT:  Net_Reconnect(); break;
+		case CMDMENU_ACT_TOGGLE_TAGS: tagsOn = !tagsOn; break;
+		case CMDMENU_ACT_TOGGLE_PERF:
 			perfOn = !perfOn;
 			if (perfOn) {
 				Hud_PerfInit(&perf);
 				if (haveWorld) World_ResetStatsMax(&world);
 			}
+			break;
+		default: break;
 		}
-		/* Z holds the chat log open -- T23's binding, in place from here so
-		 * the hidden-by-default log is testable in this milestone rather than
-		 * three tasks later. */
-		ng.hud.show = (held & PAD_TRIGGER_Z) != 0;
+		if (quit) break;   /* "Disconnect" leaves network mode for the map menu */
+
+		if (!menuFocus) {
+			if (in.openInv) {
+				invOpen = !invOpen;
+				/* No local throw on close: the cursor stack is the server's
+				 * and it will restate the slot. */
+				player.inventory.carried = (ItemStack){-1, 0, 0};
+			}
+			if (invOpen) {
+				if (in.navX) invCursor = InvCursorMove(invCursor, in.navX, 0);
+				if (in.navY) invCursor = InvCursorMove(invCursor, 0, in.navY);
+			} else {
+				if (in.hotbarDelta) {
+					Inventory_ChangeCurrentItem(&player.inventory, in.hotbarDelta);
+					NetGame_SendHeldSlot(&ng, player.inventory.currentItem);
+				}
+				if (in.dropItem) NetGame_SendAction(&ng, GCLINK_ACTION_DROP_ITEM);
+			}
+		}
+		/* Z holds the chat log open. Released, nothing of it is drawn at all --
+		 * MegaSkywars chat is high-volume and heavily formatted, and at 480p an
+		 * always-on log would sit right on top of a fight. */
+		ng.hud.show = in.showChat;
+		ConsumeUiEdges(&in);
 
 		/* A reconnect makes the proxy restate everything (world, then state,
 		 * then entities), so the table has to be empty first: anything that
@@ -677,7 +851,8 @@ static void RunNetwork(u32 curr) {
 
 		/* Drain the link. A pending map change stops the drain, so the
 		 * join-time block diff behind it is applied to the right world. */
-		if (NetGame_Poll(&ng, haveWorld ? &world : NULL)) {
+		if (NetGame_Poll(&ng, haveWorld ? &world : NULL,
+		                 haveWorld ? &player : NULL)) {
 			int idx = ng.wantMap;
 			if (haveWorld) { World_Free(&world); haveWorld = 0; }
 			u32 size = (u32)(g_maps[idx].end - g_maps[idx].data);
@@ -686,53 +861,109 @@ static void RunNetwork(u32 curr) {
 			 * to load on the next frame either, and retrying it every frame
 			 * would wedge the drain instead of just missing the geometry. */
 			NetGame_MapLoaded(&ng, idx);
-			camSeeded = 0;
-		}
-
-		/* Park the camera on the account the proxy is logged in as, once per
-		 * map. After that it is the player's to fly; X re-centres it. */
-		if (ng.tpPending && (!camSeeded || (down & PAD_BUTTON_X))) {
-			Camera_Init(&cam,
-			            (float)(ng.tpX * WORLD_BLOCK_SIZE),
-			            (float)((ng.tpY + 1.62) * WORLD_BLOCK_SIZE),
-			            (float)(ng.tpZ * WORLD_BLOCK_SIZE),
-			            ng.tpYaw, ng.tpPitch);
-			camSeeded = 1;
+			if (haveWorld) {
+				Player_Spawn(&player, &world);
+				Interact_Init(&interact);
+				/* The three local predictions the server owns instead: fall
+				 * damage, respawn, and interact.c's drop spawn. */
+				player.serverDriven = 1;
+				player.gameMode = ng.gameMode;
+				/* A mid-session map change does not necessarily repeat the
+				 * teleport, and the map's own spawn corner is not where the
+				 * server thinks we are. */
+				if (ng.tpPending)
+					Player_Teleport(&player, ng.tpX, ng.tpY, ng.tpZ,
+					                ng.tpYaw, ng.tpPitch);
+			}
+			ng.sendMovement = haveWorld;
 		}
 
 		u64 nowTB = gettime();
 		double dtUs = (double)ticks_to_microsecs(nowTB - prevTB);
 		prevTB = nowTB;
 
+		int gated = menuFocus || invOpen || !haveWorld;
+		if (!gated) Player_Look(&player, in.dYaw, in.dPitch);
+
+		act = in;
+		if (gated) Input_Clear(&act);
+
 		accum += dtUs;
 		if (accum > MAX_ACCUM_US) accum = MAX_ACCUM_US;
 		u64 tickTB = gettime();
-		while (accum >= TICK_US) { NetGame_Tick(&ng); accum -= TICK_US; }
+		while (accum >= TICK_US) {
+			NetGame_Tick(&ng);
+			if (haveWorld) {
+				Interact_Tick(&interact, &world, &player, &items, &act, &ng.ents);
+				if (!gated) Combat_Tick(&combat, &player, &in, &interact);
+				if (player.gameMode == GCLINK_MODE_SPECTATOR)
+					Player_TickSpectator(&player, &act);
+				else
+					Player_Tick(&player, &world, &act);
+
+				/* Say what happened, in the order the server wants to hear it:
+				 * the actions first, then where they left us. */
+				NetGame_SendInteract(&ng, &interact);
+				NetGame_SendCombat(&ng, &combat);
+				NetGame_SendMove(&ng, &player);
+			}
+			Input_Tick(&in);
+			Input_ClearEdges(&in);
+			Input_ClearEdges(&act);
+			accum -= TICK_US;
+		}
 		double tickUs = (double)ticks_to_microsecs(gettime() - tickTB);
 		alpha = (float)(accum / TICK_US);
 
-		Camera_Update(&cam, 0);
-		Camera_GetViewMatrix(&cam, v);
-
-		double eyeX = cam.pos.x / WORLD_BLOCK_SIZE;
-		double eyeY = cam.pos.y / WORLD_BLOCK_SIZE;
-		double eyeZ = cam.pos.z / WORLD_BLOCK_SIZE;
-
-		if (haveWorld) World_FlushRemesh(&world, REMESH_PER_FRAME, eyeX, eyeZ);
+		double eyeX = 0.0, eyeY = 0.0, eyeZ = 0.0;
+		if (haveWorld) {
+			Player_GetViewMatrix(&player, alpha, v);
+			eyeX = player.prevX + (player.x - player.prevX) * alpha;
+			eyeY = player.prevY + (player.y - player.prevY) * alpha
+			     + PLAYER_EYE_HEIGHT;
+			eyeZ = player.prevZ + (player.z - player.prevZ) * alpha;
+			World_FlushRemesh(&world, REMESH_PER_FRAME, eyeX, eyeZ);
+		} else {
+			guMtxIdentity(v);
+		}
 
 		GX_SetViewport(0, 0, rmode->fbWidth, rmode->efbHeight, 0, 1);
 		GX_InvVtxCache();
 		GX_InvalidateTexAll();
 		GX_LoadProjectionMtx(g_proj, GX_PERSPECTIVE);
 
-		if (haveWorld) World_Draw(&world, v);
+		if (haveWorld) {
+			World_Draw(&world, v);
+			/* The targeted block's outline and, while mining, the crack
+			 * overlay. An entity target takes the click instead, so the
+			 * outline goes with it. */
+			if (interact.hasTarget && !interact.hasEntity) {
+				World_DrawBlockOutline(&world, v, interact.target.bx,
+				                       interact.target.by, interact.target.bz);
+				int stage = Interact_BreakStage(&interact);
+				if (stage >= 0)
+					World_DrawBreakOverlay(&world, v, interact.curBx,
+					                       interact.curBy, interact.curBz, stage);
+			}
+		}
 		Entity_Draw(&ng.ents, v, alpha);
 
-		int nTags = Entity_CollectTags(&ng.ents, haveWorld ? &world : NULL,
+		if (haveWorld && !invOpen && player.gameMode != GCLINK_MODE_SPECTATOR)
+			HeldItem_Draw(&player, rmode->fbWidth, rmode->efbHeight, alpha);
+
+		int nTags = tagsOn
+		          ? Entity_CollectTags(&ng.ents, haveWorld ? &world : NULL,
 		                               v, g_proj, eyeX, eyeY, eyeZ,
 		                               rmode->fbWidth, rmode->efbHeight,
-		                               tags, HUD_TAG_MAX);
+		                               tags, HUD_TAG_MAX)
+		          : 0;
 		Hud_DrawTags(tags, nTags, rmode->fbWidth, rmode->efbHeight);
+
+		/* Spectator hides the hotbar, the hearts and the crosshair -- there is
+		 * nothing to hold and nothing to aim -- and Hud_DrawNetOverlay puts the
+		 * SPECTATING banner up in their place. */
+		if (haveWorld && player.gameMode != GCLINK_MODE_SPECTATOR)
+			Hud_Draw(&player, rmode->fbWidth, rmode->efbHeight, invOpen, invCursor);
 		Hud_DrawNetOverlay(&ng.hud, rmode->fbWidth, rmode->efbHeight);
 
 		if (!haveWorld) {
@@ -740,7 +971,7 @@ static void RunNetwork(u32 curr) {
 			 * is in the lobby" and "something is broken"; say which. */
 			HudScreen sc = Hud_Begin2D(rmode->fbWidth, rmode->efbHeight);
 			const char *msg = (st != NET_READY) ? "connecting to the proxy..."
-			                : "waiting for a map (the account is in the lobby)";
+			                : "waiting for a map -- D-pad Up to /join one";
 			Hud_DrawStringShadow(msg,
 			                     (int)(sc.w / 2) - Hud_StringWidth(msg) / 2,
 			                     (int)(sc.h / 2) - 4, 0xFFFFFFFFu);
@@ -750,6 +981,9 @@ static void RunNetwork(u32 curr) {
 		Hud_PerfSample(&perf, dtUs, tickUs, haveWorld ? &world : NULL,
 		               Entity_Count(&ng.ents));
 		if (perfOn) Hud_DrawPerf(&perf, rmode->fbWidth, rmode->efbHeight);
+		/* Last of the overlays: while the palette is up it has focus, so it
+		 * has to win against the perf panel rather than be drawn under it. */
+		CmdMenu_Draw(&cmd, rmode->fbWidth, rmode->efbHeight);
 		Hud_DrawNetStatus(rmode->fbWidth, rmode->efbHeight);
 
 		GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);

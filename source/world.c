@@ -286,6 +286,19 @@ static int edit_put(World *w, u32 key, int id) {
 
 /* ---- shape / collision ------------------------------------------------- */
 
+/* Material.isLiquid, on the collision/mesh hot paths.
+ *
+ * Water and lava are drawn as full cubes and collide with nothing at all:
+ * vanilla's BlockLiquid has no collision box, does not occlude its neighbours
+ * and is not something a fence connects to. Deriving that from the material
+ * here, rather than baking a second per-id table, is what makes T21 a pure
+ * lookup change with no new allocation -- and it is the fix that stops the
+ * player standing on a water surface, which the server reads as flying. */
+static inline int is_liquid(int id) {
+	return id >= 0 && (g_blockProps[id].material == MAT_WATER ||
+	                   g_blockProps[id].material == MAT_LAVA);
+}
+
 /* Neighbour connect mask for FENCE/WALL/PANE (bit0=-X,1=+X,2=-Z,3=+Z): set
  * when that neighbour is occupied and is either a plain full cube or another
  * block of the *same* shape -- vanilla's "connects to solid blocks and
@@ -298,7 +311,7 @@ static u8 connect_mask(const World *w, int bx, int by, int bz, u8 shape) {
 	int d;
 	for (d = 0; d < 4; d++) {
 		int id = World_GetBlock(w, bx + dx[d], by, bz + dz[d]);
-		if (id < 0) continue;
+		if (id < 0 || is_liquid(id)) continue;
 		u8 s = g_blockShape[id];
 		if (s == SHAPE_CUBE || s == shape) mask |= (u8)(1 << d);
 	}
@@ -307,7 +320,7 @@ static u8 connect_mask(const World *w, int bx, int by, int bz, u8 shape) {
 
 int World_BlockBoxes(const World *w, int bx, int by, int bz, BlockAABB out[2]) {
 	int id = World_GetBlock(w, bx, by, bz);
-	if (id < 0) return 0;
+	if (id < 0 || is_liquid(id)) return 0;
 	u8 shape = g_blockShape[id];
 	if (shape == SHAPE_CUBE) {
 		out[0] = (BlockAABB){0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
@@ -321,7 +334,7 @@ int World_BlockBoxes(const World *w, int bx, int by, int bz, BlockAABB out[2]) {
 
 int World_BlockBoxesFor(const World *w, int id, int bx, int by, int bz,
                         BlockAABB out[2]) {
-	if (id < 0 || id >= NUM_BLOCK_IDS) return 0;
+	if (id < 0 || id >= NUM_BLOCK_IDS || is_liquid(id)) return 0;
 	u8 shape = g_blockShape[id];
 	if (shape == SHAPE_CUBE) {
 		out[0] = (BlockAABB){0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f};
@@ -335,7 +348,7 @@ int World_BlockBoxesFor(const World *w, int id, int bx, int by, int bz,
 
 int World_BlockSolid(const World *w, int bx, int by, int bz) {
 	int id = World_GetBlock(w, bx, by, bz);
-	return id >= 0 && g_blockShape[id] == SHAPE_CUBE;
+	return id >= 0 && !is_liquid(id) && g_blockShape[id] == SHAPE_CUBE;
 }
 
 /* ---- indexed-vertex dedup --------------------------------------------------
@@ -747,7 +760,7 @@ static u8 pad_connect(const PadGrid *p, int lx, int ly, int lz, u8 shape) {
 	int d;
 	for (d = 0; d < 4; d++) {
 		u16 id = pad_get(p, lx + dx[d], ly, lz + dz[d]);
-		if (id == PAD_AIR) continue;
+		if (id == PAD_AIR || is_liquid(id)) continue;
 		u8 s = g_blockShape[id];
 		if (s == SHAPE_CUBE || s == shape) mask |= (u8)(1 << d);
 	}
@@ -793,13 +806,23 @@ static void mesh_voxel(FaceCtx *fc, const PadGrid *p, int lx, int ly, int lz,
 	nb[4] = col[ly - cs];
 	nb[5] = col[ly + cs];
 
+	int selfLiquid = is_liquid(g);
 	int f;
 	for (f = 0; f < 6; f++) {
 		/* Cull only against an opaque full-cube neighbour -- a non-cube one may
 		 * not cover this face, and a see-through cube (glass/leaves) would show
 		 * the culled face through its gaps, either way leaving a hole you look
-		 * through into the void. */
-		if (nb[f] != PAD_AIR && g_blockOpaque[nb[f]]) continue;
+		 * through into the void.
+		 *
+		 * A liquid is the glass case with one addition: it occludes *itself*.
+		 * It must not occlude terrain -- that is the whole point, or the faces
+		 * behind a pond stay culled and you see straight through the map from
+		 * underwater -- but treating it as a plain non-occluder would also emit
+		 * every internal face of that pond, and a pond is a solid block of
+		 * them. So liquid hides liquid, and nothing else. */
+		if (nb[f] != PAD_AIR &&
+		    (is_liquid(nb[f]) ? selfLiquid : (g_blockOpaque[nb[f]] != 0)))
+			continue;
 		/* Face order: 2:-Y(bottom) 3:+Y(top), others use the side tile. */
 		int tile = (f == 3) ? g_topTile[g] : (f == 2) ? g_bottomTile[g] : g;
 		emit_cube_quad(fc, vx, vy, vz, f, tile);
@@ -1538,9 +1561,12 @@ static int ray_box(const double o[3], const double d[3], const BlockAABB *b,
 
 /* Blocks a non-liquid ray passes straight through: BlockLiquid overrides
  * canCollideCheck to return false unless the trace asked for liquids, which
- * a normal look-at trace never does. Air is already handled by id < 0. */
+ * a normal look-at trace never does. Air is already handled by id < 0. Lava
+ * is the same block class as water and must be treated the same, or the
+ * crosshair would target a lava surface and the dig state machine would try to
+ * mine it. */
 static inline int ray_ignores(int id) {
-	return g_blockProps[id].material == MAT_WATER;
+	return is_liquid(id);
 }
 
 /* Test one block; returns 1 on a hit closer than *bestT. */

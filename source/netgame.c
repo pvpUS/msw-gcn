@@ -13,13 +13,13 @@ void NetGame_Init(NetGame *ng) {
 	ng->health   = 20.0f;
 	Entity_WorldInit(&ng->ents);
 	Hud_NetInit(&ng->hud);
-	Inventory_Init(&ng->inv);
 }
 
 void NetGame_Reset(NetGame *ng) {
 	Entity_WorldClear(&ng->ents);
 	Hud_NetInit(&ng->hud);
 	ng->tpPending = 0;
+	ng->usingItem = 0;
 }
 
 void NetGame_MapLoaded(NetGame *ng, int index) {
@@ -68,17 +68,24 @@ static void on_block_set(NetGame *ng, World *w, const u8 *d, u16 len) {
 	ng->blockSets += n;
 }
 
-static void on_teleport(NetGame *ng, const u8 *d, u16 len) {
+/* S08 PlayerPosLook, already resolved and converted by the proxy.
+ *
+ * The epoch is the whole point of the round trip. The console has MOVEs in
+ * flight when this arrives, describing where it was a moment ago; every one of
+ * them is now wrong, and a server that acted on them would rubberband the
+ * player straight back. So the epoch bumps, the console echoes the new one in
+ * every MOVE from here on, and the proxy throws away anything still carrying
+ * the old one. */
+static void on_teleport(NetGame *ng, Player *p, const u8 *d, u16 len) {
 	if (len < 33) return;
 	ng->tpX     = gc_get_f64(d);
 	ng->tpY     = gc_get_f64(d + 8);
 	ng->tpZ     = gc_get_f64(d + 16);
 	ng->tpYaw   = gc_get_f32(d + 24);
 	ng->tpPitch = gc_get_f32(d + 28);
-	/* Echoed back in every MOVE once T22 sends any, so the server can throw
-	 * away the ones that were in flight when it moved us. */
 	ng->teleportEpoch = gc_get_u8(d + 32);
 	ng->tpPending = 1;
+	if (p) Player_Teleport(p, ng->tpX, ng->tpY, ng->tpZ, ng->tpYaw, ng->tpPitch);
 }
 
 static void on_entity_add(NetGame *ng, const u8 *d, u16 len) {
@@ -149,23 +156,28 @@ static void on_entity_anim(NetGame *ng, const u8 *d, u16 len) {
 	if (e) Entity_Anim(e, gc_get_u8(d + 4));
 }
 
-static void on_inv_set(NetGame *ng, const u8 *d, u16 len) {
+/* S2F/S30 -> the player's own inventory, which the server owns outright once
+ * there is a game on: the kit arrives this way, every block placed comes back
+ * decremented this way, and death empties it this way. */
+static void on_inv_set(NetGame *ng, Player *p, const u8 *d, u16 len) {
 	u16 n = len / 6, i;
+	if (!p) return;
 	for (i = 0; i < n; i++) {
-		const u8 *p = d + i * 6;
-		int slot = gc_get_u8(p);
-		u16 item = gc_get_u16(p + 1);
-		u8  count = gc_get_u8(p + 3);
-		u16 meta = gc_get_u16(p + 4);
+		const u8 *q = d + i * 6;
+		int slot = gc_get_u8(q);
+		u16 item = gc_get_u16(q + 1);
+		u8  count = gc_get_u8(q + 3);
+		u16 meta = gc_get_u16(q + 4);
 		if (slot < 0 || slot >= INV_TOTAL_SIZE) continue;
 		ItemStack s;
 		if (item == GCLINK_AIR || count == 0) {
 			s.item = -1; s.meta = 0; s.count = 0;
 		} else {
-			s.item = (int)item; s.meta = (int)meta; s.count = (int)count;
+			s.item = (s16)item; s.meta = (s16)meta; s.count = (u8)count;
 		}
-		Inventory_SetSlot(&ng->inv, slot, s);
+		Inventory_SetSlot(&p->inventory, slot, s);
 	}
+	(void)ng;
 }
 
 static void on_chat(NetGame *ng, const u8 *d, u16 len, int actionBar) {
@@ -179,7 +191,7 @@ static void on_chat(NetGame *ng, const u8 *d, u16 len, int actionBar) {
 
 /* ---- the drain ---------------------------------------------------------- */
 
-int NetGame_Poll(NetGame *ng, World *w) {
+int NetGame_Poll(NetGame *ng, World *w, Player *p) {
 	NetMsg m;
 
 	if (ng->wantMap >= 0 && ng->wantMap != ng->mapIndex) return 1;
@@ -200,27 +212,54 @@ int NetGame_Poll(NetGame *ng, World *w) {
 			break;
 
 		case GC_S_BLOCK_SET:     on_block_set(ng, w, m.data, m.len); break;
-		case GC_S_TELEPORT:      on_teleport(ng, m.data, m.len); break;
+		case GC_S_TELEPORT:      on_teleport(ng, p, m.data, m.len); break;
 		case GC_S_ENTITY_ADD:    on_entity_add(ng, m.data, m.len); break;
 		case GC_S_ENTITY_MOVE:   on_entity_move(ng, m.data, m.len); break;
 		case GC_S_ENTITY_REMOVE: on_entity_remove(ng, m.data, m.len); break;
 		case GC_S_ENTITY_EQUIP:  on_entity_equip(ng, m.data, m.len); break;
 		case GC_S_ENTITY_ANIM:   on_entity_anim(ng, m.data, m.len); break;
-		case GC_S_INV_SET:       on_inv_set(ng, m.data, m.len); break;
+		case GC_S_INV_SET:       on_inv_set(ng, p, m.data, m.len); break;
 
 		case GC_S_GAME_STATE:
 			if (m.len >= 1) ng->gameState = ng->hud.gameState = gc_get_u8(m.data);
 			break;
 		case GC_S_GAME_MODE:
-			if (m.len >= 1) ng->gameMode = ng->hud.gameMode = gc_get_u8(m.data);
+			/* Death on this server is a game-mode change and nothing else --
+			 * the plugin cancels lethal damage, so there is no S07 Respawn and
+			 * no death screen to wait for. Spectator hides the hotbar, the
+			 * hearts and the crosshair (T26). */
+			if (m.len >= 1) {
+				ng->gameMode = ng->hud.gameMode = gc_get_u8(m.data);
+				if (p) p->gameMode = ng->gameMode;
+			}
 			break;
 		case GC_S_HEALTH:
-			if (m.len >= 4) ng->health = gc_get_f32(m.data);
+			/* S06 UpdateHealth. The local fall-damage prediction is gated off
+			 * (Player.serverDriven) so the two cannot fight. */
+			if (m.len >= 4) {
+				ng->health = gc_get_f32(m.data);
+				if (p) p->health = ng->health;
+			}
+			break;
+		case GC_S_SELF_VELOCITY:
+			/* Knockback. Applying this is mandatory -- ignore it and the
+			 * server moves you while you do not, which is permanent rubberband
+			 * for as long as someone is hitting you. */
+			if (m.len >= 24 && p)
+				Player_SetVelocity(p, gc_get_f64(m.data),
+				                      gc_get_f64(m.data + 8),
+				                      gc_get_f64(m.data + 16));
+			break;
+		case GC_S_USE_STATE:
+			if (m.len >= 1) {
+				ng->usingItem = gc_get_u8(m.data) != 0;
+				if (p) p->itemInUse = ng->usingItem;
+			}
 			break;
 		case GC_S_HELD_SLOT:
 			if (m.len >= 1) {
 				ng->heldSlot = gc_get_u8(m.data) & 7;
-				Inventory_SetCurrentItem(&ng->inv, ng->heldSlot);
+				if (p) Inventory_SetCurrentItem(&p->inventory, ng->heldSlot);
 			}
 			break;
 		case GC_S_XP:
@@ -233,17 +272,112 @@ int NetGame_Poll(NetGame *ng, World *w) {
 		case GC_S_CHAT:       on_chat(ng, m.data, m.len, 0); break;
 		case GC_S_ACTION_BAR: on_chat(ng, m.data, m.len, 1); break;
 
-		/* Sent by the proxy already, meaningful only once the console moves
-		 * and fights: knockback (T19) and the item-use slowdown (T22). Named
-		 * rather than defaulted so the "unhandled" log below stays about
-		 * messages that really are a surprise. */
-		case GC_S_SELF_VELOCITY:
-		case GC_S_USE_STATE:
-			break;
-
 		default:
 			break;
 		}
 	}
 	return (ng->wantMap >= 0 && ng->wantMap != ng->mapIndex);
+}
+
+/* ---- console -> proxy (T22) --------------------------------------------- */
+
+void NetGame_SendMove(NetGame *ng, const Player *p) {
+	u8 buf[34];
+	u8 flags = 0;
+
+	if (!ng->sendMovement) return;
+	/* Nothing before the first teleport. The server's hasMoved stays false
+	 * until it has had its own position echoed back (which the proxy does the
+	 * instant S08 arrives), and everything sent before that lands in a bit
+	 * bucket -- including, later, the first block placement, which is the
+	 * symptom this is actually preventing. */
+	if (!ng->tpPending) return;
+
+	if (p->onGround)  flags |= GCLINK_MOVE_ONGROUND;
+	if (p->sprinting) flags |= GCLINK_MOVE_SPRINTING;
+	if (p->sneaking)  flags |= GCLINK_MOVE_SNEAKING;
+
+	gc_put_f64(buf,      p->x);
+	gc_put_f64(buf + 8,  p->y);      /* the AABB's minY, which is the feet */
+	gc_put_f64(buf + 16, p->z);
+	gc_put_f32(buf + 24, p->yaw);
+	gc_put_f32(buf + 28, p->pitch);
+	gc_put_u8 (buf + 32, flags);
+	gc_put_u8 (buf + 33, ng->teleportEpoch);
+
+	Net_Send(GC_C_MOVE, buf, sizeof buf);
+}
+
+void NetGame_SendInteract(NetGame *ng, const Interact *it) {
+	int i;
+	(void)ng;
+	for (i = 0; i < it->evCount; i++) {
+		const InteractEvent *e = &it->ev[i];
+		u8 buf[10];
+		switch (e->kind) {
+		case INTERACT_EV_DIG:
+			gc_put_u8 (buf,     e->status);
+			gc_put_s16(buf + 1, e->bx);
+			gc_put_s16(buf + 3, e->by);
+			gc_put_s16(buf + 5, e->bz);
+			gc_put_u8 (buf + 7, e->face);
+			Net_Send(GC_C_DIG, buf, 8);
+			break;
+		case INTERACT_EV_PLACE:
+			gc_put_s16(buf,     e->bx);
+			gc_put_s16(buf + 2, e->by);
+			gc_put_s16(buf + 4, e->bz);
+			gc_put_u8 (buf + 6, e->face);
+			gc_put_u8 (buf + 7, e->curX);
+			gc_put_u8 (buf + 8, e->curY);
+			gc_put_u8 (buf + 9, e->curZ);
+			Net_Send(GC_C_PLACE, buf, 10);
+			break;
+		case INTERACT_EV_USE:
+			gc_put_u8(buf, e->status == USE_RELEASE ? GCLINK_ITEM_RELEASE
+			                                        : GCLINK_ITEM_START);
+			Net_Send(GC_C_USE_ITEM, buf, 1);
+			break;
+		default:
+			break;
+		}
+	}
+}
+
+void NetGame_SendCombat(NetGame *ng, Combat *c) {
+	(void)ng;
+	/* Order matters and it is the proxy's to enforce -- C09 held slot, then
+	 * C0A ArmSwing, then C02 UseEntity -- but the swing still has to leave
+	 * here first, because a swing with no attack behind it (a miss) is the
+	 * only thing other players see of it. */
+	if (Combat_TakeSwing(c)) Net_Send(GC_C_SWING, NULL, 0);
+
+	s32 eid = Combat_TakeAttack(c);
+	if (eid >= 0) {
+		u8 buf[5];
+		gc_put_s32(buf, eid);
+		gc_put_u8(buf + 4, GCLINK_USE_ATTACK);
+		Net_Send(GC_C_USE_ENTITY, buf, 5);
+	}
+}
+
+void NetGame_SendHeldSlot(NetGame *ng, int slot) {
+	u8 b = (u8)(slot & 7);
+	(void)ng;
+	Net_Send(GC_C_HELD_SLOT, &b, 1);
+}
+
+void NetGame_SendChat(NetGame *ng, const char *text) {
+	int n = 0;
+	(void)ng;
+	if (!text) return;
+	while (text[n] && n < 100) n++;
+	if (!n) return;
+	Net_Send(GC_C_CHAT, text, (u16)n);
+}
+
+void NetGame_SendAction(NetGame *ng, int action) {
+	u8 b = (u8)action;
+	(void)ng;
+	Net_Send(GC_C_ACTION, &b, 1);
 }

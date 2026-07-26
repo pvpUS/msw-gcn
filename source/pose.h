@@ -66,6 +66,15 @@ typedef struct {
 	float headYaw, prevHeadYaw;
 	float pitch, prevPitch;
 
+	/* First-person walk bob. EntityPlayerSP keeps cameraYaw/prevCameraYaw for
+	 * this; here it is a free-running phase advanced at the limb-swing rate, so
+	 * the item in hand sways with the legs and settles to a neutral pose at
+	 * rest. It lives on the Pose rather than as a file-static in helditem.c
+	 * because a static cannot belong to a particular player -- and because a
+	 * static advanced per rendered frame runs at the video rate, which made the
+	 * sway speed depend on the frame time. */
+	float bob, prevBob;
+
 	u8    sneaking, sprinting, onGround;
 } Pose;
 
@@ -103,6 +112,9 @@ float Pose_SwingProgress(const Pose *p, float alpha);
  * phase and `amount` the amplitude; vanilla derives the phase by rewinding
  * rather than by keeping a previous value, which is why this is one call. */
 void  Pose_LimbSwing(const Pose *p, float alpha, float *swing, float *amount);
+
+/* The interpolated first-person bob phase, in radians. See Pose.bob. */
+float Pose_Bob(const Pose *p, float alpha);
 
 /* Shortest-path angle interpolation (RendererLivingEntity.interpolateRotation),
  * so a body crossing +/-180 does not spin the long way round. */

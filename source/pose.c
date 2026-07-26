@@ -19,6 +19,13 @@
 /* How fast the body catches up with the direction of travel, per tick. */
 #define BODY_TURN_RATE 0.3f
 
+/* First-person bob, radians per 20 Hz tick: a slow idle drift plus the walk
+ * component, scaled by limbSwingAmount so it is zero standing still (which is
+ * what makes a static screenshot show the neutral pose). */
+#define BOB_IDLE_RATE 0.45f
+#define BOB_WALK_RATE 1.5f
+#define TWO_PI        6.283185307179586f
+
 float Pose_WrapDegrees(float a) {
 	a = fmodf(a, 360.0f);
 	if (a >= 180.0f) a -= 360.0f;
@@ -84,6 +91,13 @@ void Pose_Tick(Pose *p, double dx, double dz, float yaw, float pitch) {
 	p->limbSwingAmount += (speed - p->limbSwingAmount) * 0.4f;
 	p->limbSwing       += p->limbSwingAmount;
 
+	/* First-person bob phase, at the same rate the legs move. Wrapped with its
+	 * previous value so the render-time interpolation never crosses a
+	 * discontinuity and jerks the item across the screen once a minute. */
+	p->prevBob = p->bob;
+	p->bob += BOB_IDLE_RATE + p->limbSwingAmount * BOB_WALK_RATE;
+	if (p->bob > TWO_PI) { p->bob -= TWO_PI; p->prevBob -= TWO_PI; }
+
 	/* Which way the body points. Direction of travel, unless the entity is
 	 * standing still (keep the last body angle) or mid-swing (vanilla snaps
 	 * the body to the head, so a hit lands facing the target). */
@@ -129,6 +143,10 @@ float Pose_SwingProgress(const Pose *p, float alpha) {
 	float d = p->swingProgress - p->prevSwingProgress;
 	if (d < 0.0f) d += 1.0f;    /* wrapped past the end of a swing */
 	return p->prevSwingProgress + d * alpha;
+}
+
+float Pose_Bob(const Pose *p, float alpha) {
+	return p->prevBob + (p->bob - p->prevBob) * alpha;
 }
 
 void Pose_LimbSwing(const Pose *p, float alpha, float *swing, float *amount) {

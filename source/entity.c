@@ -793,6 +793,91 @@ void Entity_Draw(const EntityWorld *ew, Mtx view, float alpha) {
 	World_SetupRenderState();
 }
 
+/* ---- targeting (T18) ---------------------------------------------------- */
+
+/* Collision box half-width and height per type, in blocks. Only the two
+ * attackable types matter -- nothing else is ever a target -- but the dragon's
+ * is worth stating: EntityDragon is 16 x 8, and a crosshair that had to hit its
+ * 0.6-wide centre would never connect with it at all. */
+static void entity_size(u8 type, double *halfWidth, double *height) {
+	if (type == GCLINK_ENT_DRAGON) { *halfWidth = 8.0; *height = 8.0; }
+	else                           { *halfWidth = 0.3; *height = 1.8; }
+}
+
+/* AxisAlignedBB.calculateIntercept, reduced to "how far along the ray does it
+ * enter": the slab test. `t` comes back in the ray's own parameter, which is
+ * blocks here because the direction is a unit vector. Starting inside the box
+ * counts as a hit at distance 0, exactly as vanilla's isVecInside branch does. */
+static int ray_aabb(double ox, double oy, double oz,
+                    double dx, double dy, double dz,
+                    double x0, double y0, double z0,
+                    double x1, double y1, double z1, double *t) {
+	double lo = 0.0, hi = 1.0e30;
+	int a;
+	double o[3] = { ox, oy, oz }, d[3] = { dx, dy, dz };
+	double bmin[3] = { x0, y0, z0 }, bmax[3] = { x1, y1, z1 };
+
+	for (a = 0; a < 3; a++) {
+		if (d[a] > -1.0e-9 && d[a] < 1.0e-9) {
+			if (o[a] < bmin[a] || o[a] > bmax[a]) return 0;
+			continue;
+		}
+		double inv = 1.0 / d[a];
+		double t0 = (bmin[a] - o[a]) * inv;
+		double t1 = (bmax[a] - o[a]) * inv;
+		if (t0 > t1) { double s = t0; t0 = t1; t1 = s; }
+		if (t0 > lo) lo = t0;
+		if (t1 < hi) hi = t1;
+		if (lo > hi) return 0;
+	}
+	*t = lo;
+	return 1;
+}
+
+int Entity_RayTrace(const EntityWorld *ew, double ex, double ey, double ez,
+                    double lx, double ly, double lz,
+                    double maxDist, double blockT, s32 excludeEid,
+                    EntityHit *out) {
+	double best = (blockT < maxDist) ? blockT : maxDist;
+	int found = 0, i;
+
+	for (i = 0; i < ENTITY_MAX; i++) {
+		const Entity *e = &ew->e[i];
+		if (!e->alive || e->eid == excludeEid) continue;
+		if (!gclink_ent_attackable(e->type)) continue;
+		if (e->flags & GCLINK_EFLAG_INVISIBLE) continue;
+
+		double hw, h;
+		entity_size(e->type, &hw, &h);
+		hw += ENTITY_PICK_EXPAND;
+		double top = e->y + h + ENTITY_PICK_EXPAND;
+		double bot = e->y - ENTITY_PICK_EXPAND;
+
+		/* Cheap reject first: the box cannot be nearer than its centre is,
+		 * less its own diagonal. Sixteen players in a fight is sixteen of
+		 * these per tick and only one or two ever reach the slab test. */
+		double cx = e->x - ex, cy = (e->y + h * 0.5) - ey, cz = e->z - ez;
+		double reach = best + hw + h;
+		if (cx*cx + cy*cy + cz*cz > reach * reach) continue;
+
+		double t;
+		if (!ray_aabb(ex, ey, ez, lx, ly, lz,
+		              e->x - hw, bot, e->z - hw,
+		              e->x + hw, top, e->z + hw, &t)) continue;
+		if (t >= best) continue;      /* strictly closer, or the block wins */
+
+		best = t;
+		out->slot = i;
+		out->eid  = e->eid;
+		out->t    = t;
+		out->hx   = ex + lx * t;
+		out->hy   = ey + ly * t;
+		out->hz   = ez + lz * t;
+		found = 1;
+	}
+	return found;
+}
+
 /* ---- nametags ----------------------------------------------------------- */
 
 /* World point -> normalised device coordinates. `view` is libogc's 3x4 and

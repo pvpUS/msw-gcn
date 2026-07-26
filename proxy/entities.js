@@ -157,6 +157,15 @@ class EntityTranslator {
     setMap(m) { this.map = m; this.clear(); }
     setSelfEid(eid) { this.selfEid = eid; }
 
+    /** ENT.* for a tracked entity, or undefined. netplayer.js filters C02
+     *  ATTACK against this: the server *kicks* on an attack aimed at an item,
+     *  an xp orb or a projectile, so "we are not tracking it" has to read as
+     *  "do not attack it" rather than as "probably fine". */
+    typeOf(eid) {
+        const e = this.entities.get(eid);
+        return e ? e.type : undefined;
+    }
+
     clear() {
         if (this.entities.size && this.link.attached) {
             this.sendRemovals([...this.entities.keys()]);

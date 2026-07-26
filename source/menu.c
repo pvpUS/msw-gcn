@@ -35,7 +35,7 @@ static void DrawList(const MapEntry *maps, int count, int sel, int top,
 	 * an offline sandbox and this is a different mode entirely -- it dials a
 	 * proxy, and which map loads is the server's decision, not the player's. */
 	if (netTarget)
-		printf("\n  Y: connect and spectate  ->  %s\n", netTarget);
+		printf("\n  Y: play online  ->  %s\n", netTarget);
 }
 
 int Menu_Run(const MapEntry *maps, int count, void *xfb, GXRModeObj *rmode,
