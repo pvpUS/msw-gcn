@@ -448,12 +448,12 @@ section('entity translation');
     const { S, ENT, EFLAG, ANIM, AIR, POS_SCALE } = gclink;
     const map = mapdb.get('hontori');
 
-    const make = (cap = 128) => {
+    const make = (cap = 128, isSolid = null) => {
         const sent = [];
         const link = { attached: true, send: (t, p) => sent.push([t, Buffer.from(p)]) };
         const e = new EntityTranslator({
             link, blockmap: bm, log: { info() {}, warn() {}, error() {} },
-            config: { cap, updateHz: 20, minMoveDelta: 0.03 },
+            config: { cap, updateHz: 20, minMoveDelta: 0.03 }, isSolid,
         });
         e.setSelfEid(1);
         e.setMap(map);
@@ -657,6 +657,115 @@ section('entity translation');
         e.onDestroy({ entityIds: [60] });
         eq(of(S.ENTITY_REMOVE).length, before, 'no second removal for a landed arrow');
         eq(e.count, 1, 'and it is gone from the table');
+    }
+
+    // -- projectiles are simulated rather than waited for. The server states an
+    //    arrow's position once every twenty ticks and never sends its velocity
+    //    again, so anything that only replays packets renders a stuttering
+    //    arrow no matter how it interpolates.
+    {
+        const spawn = (e, eid, vel) => e.onObjectSpawn({
+            entityId: eid, type: 60, objectData: 5, yaw: 0, pitch: 0,
+            x: (map.originX + 10) * POS_SCALE,
+            y: (map.originY + 70) * POS_SCALE,
+            z: (map.originZ + 10) * POS_SCALE,
+            velocity: vel,
+        });
+
+        // An independent reference, written from the vanilla order: move first,
+        // then drag, then gravity. If entities.js ever reorders those this
+        // diverges immediately.
+        const reference = (ticks) => {
+            let px = map.originX + 10, py = map.originY + 70, pz = map.originZ + 10;
+            let mx = 1, my = 0, mz = 0;
+            for (let i = 0; i < ticks; i++) {
+                px += mx; py += my; pz += mz;
+                mx *= 0.99; my *= 0.99; mz *= 0.99;
+                my -= 0.05;
+            }
+            return { px, py, pz };
+        };
+
+        {
+            const { e } = make();
+            spawn(e, 70, { x: 8000, y: 0, z: 0 });     // one block per tick, +X
+            const TICKS = 8;
+            for (let i = 0; i < TICKS; i++) e.flush(map.originX, map.originY, map.originZ);
+
+            const a = e.entities.get(70);
+            const r = reference(TICKS);
+            eq(a.x, Math.round(r.px * POS_SCALE), 'arrow x matches vanilla integration');
+            eq(a.y, Math.round(r.py * POS_SCALE), 'and y, drag and gravity and all');
+            eq(a.z, Math.round(r.pz * POS_SCALE), 'and z');
+            ok(r.py < map.originY + 70, 'gravity actually pulled it down');
+            eq(e.stats.stepped, TICKS, 'stepped once per flush, not once per server packet');
+        }
+
+        // A block in the way stops it, using the live map rather than the one
+        // the .mworld shipped with. The wall is one block thick and the arrow
+        // is travelling fast enough to clear it in a single tick, so this only
+        // passes if the motion is walked in sub-steps.
+        {
+            const solid = (x, y, z) => x === 14;
+            const { e } = make(128, solid);
+            spawn(e, 71, { x: 3 * 8000, y: 0, z: 0 });   // three blocks a tick
+            for (let i = 0; i < 8; i++) e.flush(map.originX, map.originY, map.originZ);
+
+            const a = e.entities.get(71);
+            const localX = a.x / POS_SCALE - map.originX;
+            ok(!a.flying, 'stopped at the wall rather than tunnelling through it');
+            // The wall block occupies [14, 15), so 14.0 is its near face. One
+            // wire step is 1/32 of a block, which is as fine as this gets.
+            ok(localX <= 14, `never entered the block (was ${localX.toFixed(3)})`);
+            ok(localX > 13.7, `and rests against it, not a tick short (was ${localX.toFixed(3)})`);
+        }
+
+        // S15's deltas are relative to what the server last said, not to where
+        // the simulation has got to. Accumulating them onto a simulated
+        // position would compound the difference every twenty ticks.
+        {
+            const { e } = make();
+            spawn(e, 75, { x: 8000, y: 0, z: 0 });
+            for (let i = 0; i < 8; i++) e.flush(map.originX, map.originY, map.originZ);
+
+            const a = e.entities.get(75);
+            ok(a.x !== a.srvX, 'the simulation has moved on from the last server word');
+
+            const spawnX = (map.originX + 10) * POS_SCALE;
+            e.onRelMove({ entityId: 75, dX: 64, dY: 0, dZ: 0 }, false);   // +2 blocks
+            eq(a.x, spawnX + 64, 'a correction lands on the server track, not the simulated one');
+            eq(a.simX, a.x / POS_SCALE, 'and the simulation restarts from it');
+        }
+
+        // Two identical server statements in a row mean it has already landed,
+        // whatever the simulation thinks.
+        {
+            const { e } = make();
+            spawn(e, 72, { x: 8000, y: 0, z: 0 });
+            e.flush(map.originX, map.originY, map.originZ);
+            ok(e.entities.get(72).flying, 'flying after the spawn');
+
+            const at = { entityId: 72, x: (map.originX + 20) * POS_SCALE,
+                         y: (map.originY + 60) * POS_SCALE,
+                         z: (map.originZ + 10) * POS_SCALE, yaw: 0, pitch: 0 };
+            e.onTeleport(at);
+            ok(e.entities.get(72).flying, 'one statement is just a correction');
+            e.onTeleport(at);
+            ok(!e.entities.get(72).flying, 'the same one twice means it has stopped');
+        }
+
+        // A throwable does get velocity updates; a bobber is never simulated.
+        {
+            const { e } = make();
+            e.onObjectSpawn({ entityId: 73, type: 61, objectData: 1, yaw: 0, pitch: 0,
+                              x: 0, y: 0, z: 0, velocity: { x: 0, y: 0, z: 0 } });
+            e.onVelocity({ entityId: 73, velocity: { x: 8000, y: 0, z: 0 } });
+            ok(e.entities.get(73).flying, 'a snowball flies on S12 velocity');
+
+            e.onObjectSpawn({ entityId: 74, type: 90, objectData: 1, yaw: 0, pitch: 0,
+                              x: 0, y: 0, z: 0, velocity: { x: 8000, y: 0, z: 0 } });
+            ok(!e.entities.get(74).flying, 'a bobber is not: its motion needs the server RNG');
+        }
     }
 }
 

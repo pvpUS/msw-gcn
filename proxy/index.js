@@ -150,7 +150,13 @@ async function main() {
         mapdb, blockmap, link, config: config.world, log,
         getSelfEid: () => state.selfEid,
     });
-    const entities = new EntityTranslator({ link, blockmap, config: config.entities, log });
+    const entities = new EntityTranslator({
+        link, blockmap, config: config.entities, log,
+        // The proxy's map copy is kept current by applyState, so a projectile
+        // stops in the wall the game actually has rather than the one it
+        // shipped with.
+        isSolid: (x, y, z) => world.solidAt(x, y, z),
+    });
 
     world.on('map', (m) => { state.setMap(m); entities.setMap(m); });
     world.on('lobby', () => { state.setMap(null); entities.setMap(null); });
@@ -353,6 +359,7 @@ function connect(session, ctx) {
     on('chat', (p) => state.onChat(p));
     on('entity_velocity', (p) => {
         if (p.entityId === state.selfEid) state.onSelfVelocity(p);
+        else entities.onVelocity(p);
     });
 
     client.on('kick_disconnect', (p) => {

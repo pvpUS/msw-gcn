@@ -223,6 +223,13 @@ class WorldTranslator extends EventEmitter {
         }
     }
 
+    /** Is there a block at this local coordinate. Used by the projectile
+     *  simulation in entities.js, against the live copy rather than the one the
+     *  map shipped with -- players break and place all game. */
+    solidAt(x, y, z) {
+        return !!this.world && this.world.get(x, y, z) !== mworld.AIR;
+    }
+
     // ---- block changes -----------------------------------------------------
 
     /** S23 block_change. */

@@ -43,6 +43,43 @@ const MOB_TYPES = new Map([
 ]);
 
 /**
+ * Flight physics, per type, straight out of the 1.8 client's own onUpdate.
+ *
+ * The server barely tracks a projectile. EntityTracker.trackEntity gives an
+ * arrow `64, 20, false` -- a position every **twenty ticks**, and its velocity
+ * never again after the spawn packet. A snowball, pearl and potion get 10, a
+ * bobber 5; a player gets 3. Nothing about a flying arrow trips the exemptions
+ * either: isAirBorne is only set by addVelocity and jump (Entity.java:1429),
+ * and its DataWatcher does not change in flight.
+ *
+ * A vanilla client does not paper over that with interpolation -- it *runs the
+ * projectile*. EntityArrow.onUpdate integrates motion every single tick and the
+ * once-a-second packet is a correction to a simulation that is already right.
+ * So do the same here: given a spawn velocity, twenty ticks of this is what
+ * vanilla itself would have drawn.
+ *
+ * Order matters and is not the obvious one: position first, then drag, then
+ * gravity (EntityArrow.java:402,450-453; EntityThrowable.java:282-285).
+ *
+ * No bobber. EntityFishHook's motion is threaded with rand.nextFloat()
+ * (EntityFishHook.java:239-241,471), so it cannot be reproduced without the
+ * server's RNG and simulating it would diverge immediately -- and at 5 ticks it
+ * is the mildest case anyway. No dropped item either: it lies still.
+ */
+const FLIGHT = new Map([
+    [ENT.ARROW,    { drag: 0.99, gravity: 0.05 }],
+    [ENT.SNOWBALL, { drag: 0.99, gravity: 0.03 }],
+    [ENT.PEARL,    { drag: 0.99, gravity: 0.03 }],
+    [ENT.POTION,   { drag: 0.99, gravity: 0.05 }],
+]);
+
+/** Velocity on the wire is blocks per tick x8000. */
+const VEL_SCALE = 8000;
+
+/** How far the flight simulation may advance between collision samples. */
+const COLLIDE_STEP = 0.25;
+
+/**
  * How long an arrow must hold still before it counts as stuck in a block.
  *
  * A 1.8 arrow that hits something sets inGround and simply stops. The server
@@ -79,14 +116,27 @@ class Entity {
         this.moved = false;                   // changed since the last flush?
         this.hidden = false;                  // dropped from the console, still tracked here
         this.stillTicks = 0;                  // flushes since this last changed position
+
+        // Flight simulation, for the types in FLIGHT. Position is carried in
+        // blocks here rather than in the wire's fixed point: twenty ticks of
+        // drag compounding is not something to round at every step.
+        this.flying = false;
+        this.mx = 0; this.my = 0; this.mz = 0;      // blocks per tick
+        this.simX = 0; this.simY = 0; this.simZ = 0; // blocks, absolute
+        this.srvX = 0; this.srvY = 0; this.srvZ = 0; // last position the server stated
+        this.hasSrv = false;                         // ...has it stated one yet
     }
 }
 
 class EntityTranslator {
-    constructor({ link, blockmap, config, log = console }) {
+    constructor({ link, blockmap, config, log = console, isSolid = null }) {
         this.link = link;
         this.bm = blockmap;
         this.log = log;
+        // (localX, localY, localZ) -> is there a block there. Optional: without
+        // it projectiles still fly, they just do not stop on impact until the
+        // server says so.
+        this.isSolid = isSolid;
         this.cap = config.cap ?? 128;
         this.minDelta = Math.round((config.minMoveDelta ?? 0.03) * POS_SCALE) || 1;
 
@@ -101,7 +151,7 @@ class EntityTranslator {
 
         this.pendingAnims = [];
         this.pendingEquip = [];
-        this.stats = { added: 0, dropped: 0, evicted: 0, moves: 0, landed: 0 };
+        this.stats = { added: 0, dropped: 0, evicted: 0, moves: 0, landed: 0, stepped: 0 };
     }
 
     setMap(m) { this.map = m; this.clear(); }
@@ -130,7 +180,7 @@ class EntityTranslator {
     onPlayerSpawn(pkt) {
         const e = this.track(pkt.entityId, ENT.PLAYER);
         if (!e) return;
-        e.x = pkt.x; e.y = pkt.y; e.z = pkt.z;
+        this.serverPos(e, pkt.x, pkt.y, pkt.z);
         e.yaw = pkt.yaw & 0xff; e.pitch = pkt.pitch & 0xff;
         e.held = this.itemId(pkt.currentItem);
         this.uuidOf.set(e.eid, pkt.playerUUID);
@@ -146,9 +196,51 @@ class EntityTranslator {
         if (type === undefined) { this.stats.dropped++; return; }
         const e = this.track(pkt.entityId, type);
         if (!e) return;
-        e.x = pkt.x; e.y = pkt.y; e.z = pkt.z;
+        this.serverPos(e, pkt.x, pkt.y, pkt.z);
         e.yaw = pkt.yaw & 0xff; e.pitch = pkt.pitch & 0xff;
+        // objectData is the shooter's id + 1 for a projectile, so it is never
+        // zero and the velocity fields are present. This is the only velocity
+        // an arrow will ever be given.
+        if (pkt.velocity) this.setVelocity(e, pkt.velocity);
+    }
+
+    /** S12 entity_velocity for someone else's projectile. Arrows never get one
+     *  (trackEntity passes sendVelocityUpdates false); the throwables do. */
+    onVelocity(pkt) {
+        const e = this.entities.get(pkt.entityId);
+        if (e && pkt.velocity) this.setVelocity(e, pkt.velocity);
+    }
+
+    setVelocity(e, v) {
+        if (!FLIGHT.has(e.type)) return;
+        e.mx = v.x / VEL_SCALE;
+        e.my = v.y / VEL_SCALE;
+        e.mz = v.z / VEL_SCALE;
+        // A projectile spawned with no velocity at all is one already at rest.
+        e.flying = (e.mx !== 0 || e.my !== 0 || e.mz !== 0);
+    }
+
+    /**
+     * A position the server has stated, and the only way one gets in.
+     *
+     * srvX/Y/Z is the server's own track, kept apart from e.x because e.x is
+     * where the *simulation* has a projectile -- and S15's deltas are relative
+     * to what the server last said, not to what we extrapolated since. Adding
+     * them to a simulated position would compound the difference every twenty
+     * ticks instead of correcting it.
+     */
+    serverPos(e, x, y, z) {
+        const restated = e.hasSrv && x === e.srvX && y === e.srvY && z === e.srvZ;
+        e.srvX = x; e.srvY = y; e.srvZ = z;
+        e.hasSrv = true;
+        e.x = x; e.y = y; e.z = z;
         e.moved = true;
+
+        if (!FLIGHT.has(e.type)) return;
+        // The same position twice running means it has stopped -- an arrow in a
+        // wall. Stop flying it; the reaper takes it from there.
+        if (restated) e.flying = false;
+        e.simX = x / POS_SCALE; e.simY = y / POS_SCALE; e.simZ = z / POS_SCALE;
     }
 
     /** S0F spawn_entity_living -- the ender dragon, and nothing else. */
@@ -157,10 +249,9 @@ class EntityTranslator {
         if (type === undefined) { this.stats.dropped++; return; }
         const e = this.track(pkt.entityId, type);
         if (!e) return;
-        e.x = pkt.x; e.y = pkt.y; e.z = pkt.z;
+        this.serverPos(e, pkt.x, pkt.y, pkt.z);
         e.yaw = pkt.yaw & 0xff; e.pitch = pkt.pitch & 0xff;
         this.applyMetadata(e, pkt.metadata);
-        e.moved = true;
     }
 
     track(eid, type) {
@@ -177,13 +268,13 @@ class EntityTranslator {
     // ---- movement ----------------------------------------------------------
 
     /** S15 rel_entity_move and S17 entity_move_look: deltas are int8 x32, so a
-     *  little under four blocks. Accumulated into the absolute position. */
+     *  little under four blocks. Accumulated onto the server's own track, not
+     *  onto where the simulation has got to -- see serverPos. */
     onRelMove(pkt, hasLook) {
         const e = this.entities.get(pkt.entityId);
         if (!e) return;
-        e.x += pkt.dX; e.y += pkt.dY; e.z += pkt.dZ;
+        this.serverPos(e, e.srvX + pkt.dX, e.srvY + pkt.dY, e.srvZ + pkt.dZ);
         if (hasLook) { e.yaw = pkt.yaw & 0xff; e.pitch = pkt.pitch & 0xff; }
-        e.moved = true;
     }
 
     /** S16 entity_look: rotation only, no position. */
@@ -199,9 +290,8 @@ class EntityTranslator {
     onTeleport(pkt) {
         const e = this.entities.get(pkt.entityId);
         if (!e) return;
-        e.x = pkt.x; e.y = pkt.y; e.z = pkt.z;
+        this.serverPos(e, pkt.x, pkt.y, pkt.z);
         e.yaw = pkt.yaw & 0xff; e.pitch = pkt.pitch & 0xff;
-        e.moved = true;
     }
 
     /** S13 entity_destroy. */
@@ -368,6 +458,7 @@ class EntityTranslator {
     flush(selfX, selfY, selfZ) {
         if (!this.link.attached || !this.map) return;
 
+        this.stepFlight();
         this.enforceCap(selfX, selfY, selfZ);
 
         for (const e of this.entities.values()) {
@@ -420,6 +511,69 @@ class EntityTranslator {
         this.pendingAnims.length = 0;
 
         this.reapLanded();
+    }
+
+    /**
+     * Advance every projectile one tick, exactly as the client that shot it is
+     * already doing. See FLIGHT for why this is not optional.
+     *
+     * Collision is checked against the proxy's own copy of the map, which
+     * applyState keeps current with every block the game breaks or places -- so
+     * an arrow stops in the wall it hit rather than sailing through it for the
+     * up-to-a-second before the server gets around to mentioning it. Any
+     * non-air block stops it: erring toward stopping early costs a few
+     * centimetres, and the next server position corrects it regardless.
+     */
+    stepFlight() {
+        for (const e of this.entities.values()) {
+            if (!e.flying) continue;
+            const f = FLIGHT.get(e.type);
+            if (!f) continue;
+
+            // Walk the tick's motion in short steps rather than sampling only
+            // where it ends up. A drawn bow puts an arrow at about three blocks
+            // a tick, so one sample per tick tests points three blocks apart
+            // and misses every wall thinner than that -- the arrow would pass
+            // clean through the map. Sub-stepping also leaves it resting
+            // against the block it hit instead of a tick's flight short of it.
+            const n = Math.max(1, Math.ceil(
+                Math.sqrt(e.mx * e.mx + e.my * e.my + e.mz * e.mz) / COLLIDE_STEP));
+            const sx = e.mx / n, sy = e.my / n, sz = e.mz / n;
+
+            for (let i = 0; i < n; i++) {
+                const nx = e.simX + sx, ny = e.simY + sy, nz = e.simZ + sz;
+                if (this.blocked(nx, ny, nz)) { e.flying = false; break; }
+                e.simX = nx; e.simY = ny; e.simZ = nz;
+            }
+
+            if (e.flying) {
+                e.mx *= f.drag; e.my *= f.drag; e.mz *= f.drag;
+                e.my -= f.gravity;
+            }
+
+            e.x = Math.round(e.simX * POS_SCALE);
+            e.y = Math.round(e.simY * POS_SCALE);
+            e.z = Math.round(e.simZ * POS_SCALE);
+
+            // An arrow points along its flight (EntityArrow.java:406-408).
+            // Vanilla eases this by 0.2 per tick; straight from the motion is
+            // indistinguishable at arrow speeds and carries no extra state.
+            const flat = Math.sqrt(e.mx * e.mx + e.mz * e.mz);
+            e.yaw = angleToByte(Math.atan2(e.mx, e.mz) * 180 / Math.PI);
+            e.pitch = angleToByte(Math.atan2(e.my, flat) * 180 / Math.PI);
+
+            e.moved = true;
+            this.stats.stepped++;
+        }
+    }
+
+    /** Is the simulation's next point inside a block. Absolute coordinates in,
+     *  because that is what the simulation carries. */
+    blocked(x, y, z) {
+        if (!this.isSolid || !this.map) return false;
+        return this.isSolid(Math.floor(x) - this.map.originX,
+                            Math.floor(y) - this.map.originY,
+                            Math.floor(z) - this.map.originZ);
     }
 
     /**
@@ -520,7 +674,8 @@ class EntityTranslator {
     report() {
         const s = this.stats;
         return `entities ${this.entities.size} live, ${s.added} added, ` +
-               `${s.dropped} filtered out, ${s.landed} arrows landed, ` +
+               `${s.dropped} filtered out, ${s.stepped} flight steps, ` +
+               `${s.landed} arrows landed, ` +
                `${s.evicted} evicted, ${s.moves} moves sent`;
     }
 }
