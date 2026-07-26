@@ -227,7 +227,9 @@ void Entity_MoveTo(Entity *e, double x, double y, double z,
                    float yaw, float pitch) {
 	e->tx = x; e->ty = y; e->tz = z;
 	e->tyaw = yaw; e->tpitch = pitch;
-	e->lerpTicks = ENTITY_LERP_TICKS;
+	/* Zero ticks means the next Entity_TickAll assigns the target outright,
+	 * which is what vanilla's base Entity does -- see gclink_ent_smoothed. */
+	e->lerpTicks = gclink_ent_smoothed(e->type) ? ENTITY_LERP_TICKS : 0;
 }
 
 void Entity_Anim(Entity *e, u8 anim) {
@@ -252,7 +254,10 @@ void Entity_TickAll(EntityWorld *ew) {
 		if (e->lerpTicks > 0) {
 			/* EntityOtherPlayerMP.onUpdate: close a fraction of the remaining
 			 * gap each tick rather than jumping, so a 20 Hz position stream
-			 * arriving out of phase with the console's tick does not buzz. */
+			 * arriving out of phase with the console's tick does not buzz.
+			 * Players and the dragon only -- a projectile takes the else
+			 * branch, because easing something that moves 3 blocks a tick
+			 * leaves it trailing rather than smooth. */
 			double n = (double)e->lerpTicks;
 			e->x += (e->tx - e->x) / n;
 			e->y += (e->ty - e->y) / n;

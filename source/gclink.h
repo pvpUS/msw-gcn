@@ -220,6 +220,27 @@ static inline int gclink_ent_attackable(u8 type) {
 	return type == GCLINK_ENT_PLAYER || type == GCLINK_ENT_DRAGON;
 }
 
+/* Which entities close a position gap over several ticks instead of snapping
+ * to it. The same two types as above today, but a different question: that one
+ * is about what the server lets you hit, this one is about how vanilla moves
+ * things.
+ *
+ * `Entity.setPositionAndRotation2` (Entity.java:2013) takes a
+ * posRotationIncrements argument and **ignores it**, calling setPosition
+ * outright. Only EntityLivingBase (EntityLivingBase.java:2111) and
+ * EntityOtherPlayerMP (EntityOtherPlayerMP.java:39) override it to store the
+ * target and ease toward it. So a player and the dragon smooth; an arrow, a
+ * snowball, a pearl, a potion, a bobber and a dropped item do not.
+ *
+ * Smoothing a projectile is not a small cosmetic error. The easing closes a
+ * fraction of the gap per tick, but a projectile gets a fresh target every
+ * tick, so it never closes -- it settles into trailing its true position by
+ * several blocks and stuttering. The artifact scales with speed, which is why
+ * a player at 0.2 blocks/tick looks fine and an arrow at 3 looks broken. */
+static inline int gclink_ent_smoothed(u8 type) {
+	return type == GCLINK_ENT_PLAYER || type == GCLINK_ENT_DRAGON;
+}
+
 /* GC_S_ENTITY_ADD flags, from the 1.8 entity metadata byte at index 0. */
 enum {
 	GCLINK_EFLAG_SNEAKING  = 1 << 0,
