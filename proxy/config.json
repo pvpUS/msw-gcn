@@ -8,6 +8,12 @@
   "server": {
     "host": "localhost",
     "port": 25565,
+    "_host": [
+      "The address you would type into the client -- megaskywars.com, not the",
+      "machine behind it. Leaving the port at 25565 means 'no port given', and",
+      "then _minecraft._tcp.<host> is resolved first, exactly as a client does.",
+      "Most server domains have only that SRV record and no A record at all."
+    ],
     "version": "1.8.9",
     "username": "",
     "_username": [

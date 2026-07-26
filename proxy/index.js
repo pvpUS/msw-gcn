@@ -19,6 +19,8 @@
  */
 
 const fs = require('fs');
+const net = require('net');
+const dns = require('dns');
 const path = require('path');
 
 const gclink = require('./gclink');
@@ -31,6 +33,8 @@ const { StateTranslator } = require('./state');
 
 const TICK_MS = 50;           // 20 Hz, the server's tick and the console's
 const AUTH = 'microsoft';     // not configurable -- see loadConfig()
+const MC_PORT = 25565;        // "no port given"; only then is SRV consulted
+const SRV_FALLBACK_DNS = ['1.1.1.1', '8.8.8.8'];
 
 // ---- arguments and configuration -------------------------------------------
 const argv = process.argv.slice(2);
@@ -161,6 +165,13 @@ async function main() {
     });
     link.on('message', (type, payload) => onConsoleMessage(type, payload, { state, log }));
 
+    // Once, not per reconnect: an SRV record that has just changed is not the
+    // failure this is here to survive, and a resolver round trip on every
+    // backoff attempt would only slow reconnection down.
+    const addr = await resolveServer(config.server.host, config.server.port, log);
+    config.server.host = addr.host;
+    config.server.port = addr.port;
+
     const session = { client: null, closing: false, attempts: 0 };
     connect(session, { config, log, link, state, world, entities });
 
@@ -212,6 +223,48 @@ function installStdinConsole({ state, log }) {
         }
         state.say(s);
     });
+}
+
+/**
+ * Resolve the server address the way a Minecraft client does.
+ *
+ * A server domain often has no A record at all -- megaskywars.com does not, and
+ * only `_minecraft._tcp.megaskywars.com` points anywhere (at a TCPShield edge).
+ * minecraft-protocol does consult SRV, but through c-ares, which asks the DNS
+ * servers in the adapter's configuration and gives up if they do not answer. A
+ * machine with a local resolver configured but not listening is the bad case:
+ * getaddrinfo still works, c-ares gets ECONNREFUSED, and the library falls back
+ * to an A lookup that cannot possibly succeed.
+ *
+ * So resolve here, with a public resolver as the second try, and hand the
+ * library a host it can reach. The handshake then carries the resolved name,
+ * which is both what a real client sends and what host-based routers key on.
+ *
+ * Only when no port was given, matching the library and the vanilla client.
+ */
+async function resolveServer(host, port, log) {
+    if (port !== MC_PORT || net.isIP(host) || host === 'localhost') return { host, port };
+
+    const viaSrv = (resolver) => new Promise((resolve) => {
+        resolver.resolveSrv('_minecraft._tcp.' + host, (err, addrs) =>
+            resolve(err || !addrs || !addrs.length ? null : addrs));
+    });
+
+    let addrs = await viaSrv(dns);
+    if (!addrs) {
+        const r = new dns.Resolver();
+        r.setServers(SRV_FALLBACK_DNS);
+        addrs = await viaSrv(r);
+        if (addrs) {
+            log.warn(`the system resolver (${dns.getServers().join(', ')}) did not ` +
+                     `answer SRV -- used ${SRV_FALLBACK_DNS[0]} instead`);
+        }
+    }
+    if (!addrs) return { host, port };
+
+    addrs.sort((a, b) => a.priority - b.priority || b.weight - a.weight);
+    log.info(`SRV ${host} -> ${addrs[0].name}:${addrs[0].port}`);
+    return { host: addrs[0].name, port: addrs[0].port };
 }
 
 // ---- the Minecraft side ------------------------------------------------------
