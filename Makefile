@@ -31,7 +31,9 @@ LDFLAGS		= -g $(MACHDEP) -Wl,-Map,$(notdir $@).map
 #---------------------------------------------------------------------------------
 # any extra libraries we wish to link with the project
 #---------------------------------------------------------------------------------
-LIBS	:=	-logc -lm
+# -lbba is the Broadband Adapter's lwIP stack: if_config and the net_* socket
+# calls source/net.c uses live there, not in libogc (which only declares them).
+LIBS	:=	-lbba -logc -lm
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing

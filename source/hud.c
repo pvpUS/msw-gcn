@@ -6,6 +6,7 @@
 
 #include "hud.h"
 #include "world.h"
+#include "net.h"
 #include "inventory.h"
 #include "atlas_gen.h"   /* ATLAS_COLS/CELL/PAD/TILE/TEX_W/TEX_H */
 #include "font_gen.h"    /* generated: FONT_*, g_fontWidth[]     */
@@ -576,5 +577,39 @@ void Hud_DrawPerf(const HudPerf *pf, int fbWidth, int efbHeight) {
 	Hud_DrawStringShadow(line, x, y, 0xFFFFFFFFu);
 
 	(void)sc;
+	Hud_End2D();
+}
+
+/* ---- connection indicator (T3) ------------------------------------------ */
+
+void Hud_DrawNetStatus(int fbWidth, int efbHeight) {
+	NetState st = Net_GetState();
+	if (st == NET_DOWN && Net_LastError()[0] == '\0') return;
+
+	HudScreen sc = Hud_Begin2D(fbWidth, efbHeight);
+
+	char line[64];
+	int n = 0;
+	app_str(line, sizeof line, &n, "net ");
+	app_str(line, sizeof line, &n, Net_StateText());
+	if (st == NET_READY) {
+		app_str(line, sizeof line, &n, " ");
+		app_int(line, sizeof line, &n, (int)Net_RttMs());
+		app_str(line, sizeof line, &n, "ms");
+	} else if (Net_LastError()[0]) {
+		app_str(line, sizeof line, &n, ": ");
+		app_str(line, sizeof line, &n, Net_LastError());
+	}
+
+	u32 color = (st == NET_READY)  ? 0x55FF55FFu
+	          : (st == NET_DOWN)   ? 0xFF5555FFu
+	          : (st == NET_IDLE)   ? 0xFFAA00FFu : 0xFFFF55FFu;
+
+	int w = Hud_StringWidth(line);
+	int x = (int)sc.w - w - 3;
+	tev_flat();
+	rect((float)(x - 2), 1.0f, (float)(w + 4), 10.0f, 0, 0, 0, 150);
+	Hud_DrawStringShadow(line, x, 2, color);
+
 	Hud_End2D();
 }

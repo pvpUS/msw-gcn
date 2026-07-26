@@ -23,6 +23,8 @@
 #include "helditem.h"
 #include "entityitem.h"
 #include "interact.h"
+#include "net.h"
+#include "blockmap_gen.h"  /* BLOCKMAP_HASH, for the handshake readout */
 #include "menu.h"
 #include "maps_gen.h"
 #include "gallery_tour_gen.h"
@@ -128,6 +130,68 @@ static void FillDemoItems(Player *player) {
  * BBA plan is read off it, and on a 24 MB machine an unmeasured budget is an
  * aspiration. */
 #define PERF_HUD 1
+
+/* GCLink transport self-test (T3). Boots straight past the menu into a screen
+ * that brings up the Broadband Adapter, dials the proxy and reports the link:
+ * DHCP address, state machine, round trip, byte counters and the reason the
+ * last link ended. Everything above the transport -- entities, blocks, the
+ * game itself -- is later work; what this proves is that a GameCube can hold a
+ * framed conversation with the proxy and recover on its own when it cannot.
+ *
+ * Pull the proxy down while it runs: the indicator should go amber, retry on
+ * its own, and come back green without a reboot.
+ *
+ * NET_PROXY_IP is the machine running proxy/stub.js. A #define for now; T11
+ * gives it a menu entry. */
+#define NET_TEST_MODE 0
+#define NET_PROXY_IP  "192.168.4.40"
+
+#if NET_TEST_MODE
+static void NetTest(void) {
+	console_init(xfb[0], 0, 0, rmode->fbWidth, rmode->xfbHeight,
+	             rmode->fbWidth * 2);
+	VIDEO_SetNextFramebuffer(xfb[0]);
+	VIDEO_Flush();
+
+	printf("\x1b[2J\x1b[1;1H  GCLINK TRANSPORT TEST\n\n");
+	printf("  bringing up the broadband adapter (DHCP)...\n");
+
+	if (!Net_Init(20)) {
+		printf("\n  FAILED: %s\n", Net_LastError());
+		printf("  In Dolphin: Config > GameCube > SP1 > Broadband Adapter.\n");
+		while (1) VIDEO_WaitVSync();
+	}
+	printf("  ip %s  gateway %s\n\n", Net_LocalIp(), Net_Gateway());
+	printf("  dialling %s:%d ...\n\n", NET_PROXY_IP, GCLINK_PORT);
+	Net_Connect(NET_PROXY_IP, GCLINK_PORT);
+
+	u32 frames = 0, msgs = 0;
+	u8  lastType = 0;
+	while (1) {
+		VIDEO_WaitVSync();
+		PAD_ScanPads();
+		if (PAD_ButtonsDown(0) & PAD_BUTTON_START) break;
+		if (PAD_ButtonsDown(0) & PAD_BUTTON_A) Net_Reconnect();
+
+		NetMsg m;
+		while (Net_Poll(&m)) { msgs++; lastType = m.type; }
+
+		/* Once a second, so the console is readable rather than a blur. */
+		if (++frames % 60) continue;
+		printf("\x1b[8;1H");
+		printf("  state    %-12s                       \n", Net_StateText());
+		printf("  rtt      %u ms                        \n", Net_RttMs());
+		printf("  traffic  %u B in / %u B out           \n",
+		       Net_BytesIn(), Net_BytesOut());
+		printf("  frames   %u passed up, last type 0x%02X\n", msgs, lastType);
+		printf("  last err %-40s\n",
+		       Net_LastError()[0] ? Net_LastError() : "-");
+		printf("\n  blockmap hash 0x%08X   A: redial   Start: exit\n",
+		       (unsigned)BLOCKMAP_HASH);
+	}
+	Net_Disconnect(NULL);
+}
+#endif
 
 /* Boot-time map audit: load and free every embedded map in turn and report,
  * on the libogc console, what each one costs and whether it gave the memory
@@ -366,6 +430,10 @@ static void RunWorld(World *w, u32 curr) {
 		 * mark stay honest across a toggle. */
 		Hud_PerfSample(&perf, dtUs, tickUs, w, CountEntities(&items));
 		if (perfOn) Hud_DrawPerf(&perf, rmode->fbWidth, rmode->efbHeight);
+		/* Draws nothing until the network has been brought up, so this costs
+		 * offline play a branch and gives network mode (T11) the indicator
+		 * already in place. */
+		Hud_DrawNetStatus(rmode->fbWidth, rmode->efbHeight);
 
 		GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
 		GX_SetColorUpdate(GX_TRUE);
@@ -434,6 +502,10 @@ int main(int argc, char **argv) {
 
 #if MAP_AUDIT_MODE
 	MapAudit();   /* never returns */
+#endif
+#if NET_TEST_MODE
+	NetTest();
+	return 0;
 #endif
 
 	/* Set to a map index to bypass the menu (rendering smoke test); -1 = menu. */

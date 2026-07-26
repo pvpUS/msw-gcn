@@ -105,6 +105,14 @@ void Hud_DrawPerf(const HudPerf *pf, int fbWidth, int efbHeight);
 u32 Hud_HeapFree(void);
 u32 Hud_HeapUsed(void);
 
+/* ---- connection indicator (T3) ------------------------------------------
+ * One line, top-right, in its own 2D pass: the GCLink state, the round trip
+ * the proxy last measured, and why the link ended if it did. Colour-coded, so
+ * a glance is enough -- the failure this guards against is playing on for
+ * thirty seconds without noticing the proxy went away. Draws nothing when the
+ * network was never brought up. */
+void Hud_DrawNetStatus(int fbWidth, int efbHeight);
+
 /* Draw the HUD for `p`. fbWidth/efbHeight are the current EFB dimensions (the
  * same values passed to GX_SetViewport). `invOpen` shows the full inventory
  * screen, with `cursorSlot` (a main-inventory index 0-35) highlighted. Leaves
