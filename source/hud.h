@@ -36,6 +36,10 @@ typedef struct {
  * passed to GX_SetViewport). */
 HudScreen Hud_Begin2D(int fbWidth, int efbHeight);
 
+/* The same geometry without touching GX -- for callers that need to know where
+ * gui space is before the pass starts, such as projecting a nametag into it. */
+HudScreen Hud_Screen(int fbWidth, int efbHeight);
+
 /* Restore the world's render state (World_SetupRenderState + z-test). The
  * caller must reload the perspective projection before the next World_Draw. */
 void Hud_End2D(void);
@@ -63,6 +67,85 @@ int Hud_DrawStringShadow(const char *s, int x, int y, u32 rgba);
 /* FontRenderer.getStringWidth: the pen advance for the whole string, with
  * formatting codes excluded. */
 int Hud_StringWidth(const char *s);
+
+/* ---- nametags (T10) -----------------------------------------------------
+ * Vanilla billboards a nametag in the 3D pass; this projects the head position
+ * to gui space on the CPU and draws the string flat instead. The result is the
+ * same -- a billboard scaled by distance has constant apparent size, which is
+ * what flat text already is -- for one vector-matrix multiply per tag and no
+ * extra GX state.
+ *
+ * The costs of that trade are handled where they arise: depth is not tested,
+ * so entity.c drops occluded tags with the block ray-trace it already has, and
+ * every tag of a frame goes into one GX_Begin here rather than one per string.
+ * Both matter -- text is the predictable hot spot on this target. */
+#define HUD_TAG_MAX  16
+#define HUD_TAG_TEXT 26
+
+typedef struct {
+	s16  x, y;      /* gui space; x is the *centre* of the string  */
+	u32  colour;    /* 0xRRGGBBAA, team colour resolved by caller  */
+	char text[HUD_TAG_TEXT];
+} HudTag;
+
+/* Draw `n` already-projected tags in one 2D pass and one GX_Begin. */
+void Hud_DrawTags(const HudTag *tags, int n, int fbWidth, int efbHeight);
+
+/* ---- network HUD: chat, action bar, XP (T10) ----------------------------
+ * Deliberately not vanilla. Vanilla shows every chat line for ten seconds and
+ * fades it; MegaSkywars chat is high-volume, heavily formatted and, at 480p,
+ * would sit right on top of a fight. So the log is **hidden unless asked for**
+ * and everything the player must not miss goes to the action bar, which is
+ * always on. The unread counter is what makes that safe: without it, hidden
+ * chat means silently missing every game announcement.
+ *
+ * A scrollback ring rather than a "what arrived while it was open" buffer, for
+ * the same reason -- opening the log has to show history or it is useless. */
+#define HUD_CHAT_LINES 50    /* scrollback ring depth                     */
+#define HUD_CHAT_WIDTH 54    /* characters per line, incl. NUL (see wrap) */
+#define HUD_CHAT_SHOWN 10    /* lines drawn while the log is held open    */
+#define HUD_BAR_TEXT   80
+
+/* GuiIngame.overlayMessageTime: the action bar holds for 60 ticks and fades
+ * over the last 20 of them. */
+#define HUD_BAR_TICKS 60
+#define HUD_BAR_FADE  20
+
+typedef struct {
+	char line[HUD_CHAT_LINES][HUD_CHAT_WIDTH];
+	u8   lineColour[HUD_CHAT_LINES];   /* MC colour code, 0xFF = default */
+	int  head;                         /* next ring slot to write        */
+	int  count;                        /* lines held, <= HUD_CHAT_LINES  */
+	int  unread;                       /* since the log was last shown   */
+	int  show;                         /* the chat button is held        */
+
+	char bar[HUD_BAR_TEXT];
+	u8   barColour;
+	int  barTicks;                     /* counts down to 0               */
+
+	int   xpLevel;                     /* = ranked elo on this server    */
+	float xpBar;
+	int   gameMode;                    /* 0 survival, 3 spectator        */
+	int   gameState;                   /* GCLINK_GAME_*                  */
+} HudNet;
+
+void Hud_NetInit(HudNet *n);
+
+/* Append a chat line, wrapping it across as many ring entries as it needs.
+ * `colour` is an MC colour-code index (0-15) or 0xFF for plain white. */
+void Hud_NetChat(HudNet *n, u8 colour, const char *text, int len);
+
+/* Replace the action bar. Empty text clears it. */
+void Hud_NetActionBar(HudNet *n, u8 colour, const char *text, int len);
+
+/* One 20 Hz tick: ages the action bar out. */
+void Hud_NetTick(HudNet *n);
+
+/* Draw the network HUD -- action bar, XP level, spectator banner, the unread
+ * indicator, and the chat log if `n->show`. Its own 2D pass, so it composes
+ * with or without Hud_Draw. (Hud_Draw itself is unchanged: offline play must
+ * stay behaviourally identical, and spectate mode has no hotbar to draw.) */
+void Hud_DrawNetOverlay(const HudNet *n, int fbWidth, int efbHeight);
 
 /* ---- perf overlay (T27) -------------------------------------------------
  * Every budget in the BBA plan -- peak heap, frame time, remesh cost per

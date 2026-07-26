@@ -1,4 +1,4 @@
-/*---------------------------------------------------------------------------------
+﻿/*---------------------------------------------------------------------------------
 
 	msw-gcn - Mega Skywars for the GameCube
 
@@ -24,6 +24,8 @@
 #include "entityitem.h"
 #include "interact.h"
 #include "net.h"
+#include "netgame.h"
+#include "entity.h"
 #include "blockmap_gen.h"  /* BLOCKMAP_HASH, for the handshake readout */
 #include "menu.h"
 #include "maps_gen.h"
@@ -77,6 +79,34 @@ static Mtx44 g_proj;
  * place loop with an empty controller. Leave at 0 for normal play; pair with
  * TEST_AUTOLOAD to skip the menu. */
 #define INTERACT_TEST_MODE 0
+
+/* Dirty chunks World_FlushRemesh (T24) may re-mesh per rendered frame. A
+ * ceiling, not a quota: the flush also stops on its own wall-clock budget, so
+ * on the dense maps (where the worst chunk measures ~9 ms) a heavy chunk
+ * self-limits the frame to itself, and the rest of the time both go. The perf
+ * overlay's `dirty` and `chunk` readouts are how that is checked rather than
+ * assumed.
+ *
+ * Offline play never has a dirty chunk -- interact.c uses the synchronous
+ * World_SetBlock -- so this costs an early-out until network mode (T11) starts
+ * feeding World_SetBlockDeferred. */
+#define REMESH_PER_FRAME 2
+
+/* Deferred-re-mesh stress test (T24's "done when"): on frame 120, apply a
+ * 2000-block burst through World_SetBlockDeferred in a single frame, the shape
+ * a proxy join-time chunk diff arrives in. Fires twice: the first burst warms
+ * the path (under Dolphin the first deferred flush also pays to JIT-compile
+ * pad_fill's edit-overlay branch, which the load-time mesh never takes), the
+ * second is the one whose numbers count. Read them off the perf overlay --
+ * `dirty` spikes and drains, `chunk` is the worst single re-mesh, `frame` max
+ * catches the burst frame -- plus the two lines this draws underneath.
+ *
+ * Measured on mega_aegis: 2000 edits stage in 6.2 ms, 42 chunks drain in 25
+ * frames, worst chunk 8.6 ms and worst frame 22.9 (mesher-bound, see
+ * FLUSH_BUDGET_US in world.c for what the residual is and what removing it
+ * would take). Pair with TEST_AUTOLOAD to skip the menu; 0 for normal play. */
+#define REMESH_BURST_TEST 0
+#define REMESH_BURST_BLOCKS 2000
 
 /* Inventory-screen cursor movement. The 36 main slots are navigated as a 4x9
  * grid -- rows 0-2 are the storage grid (indices 9-35), row 3 is the hotbar
@@ -145,6 +175,13 @@ static void FillDemoItems(Player *player) {
  * gives it a menu entry. */
 #define NET_TEST_MODE 0
 #define NET_PROXY_IP  "192.168.4.40"
+
+/* Boot straight into network mode instead of the menu (T11). Dolphin cannot
+ * be driven by injected controller input in this setup -- see the project's
+ * testing notes -- so the only way to reach a mode that lives behind a
+ * keypress is to compile the keypress away, the same trick TEST_AUTOLOAD uses
+ * for the map list. Leave at 0 for normal play. */
+#define NET_AUTOLOAD 0
 
 #if NET_TEST_MODE
 static void NetTest(void) {
@@ -247,6 +284,69 @@ static void MapAudit(void) {
 }
 #endif
 
+#if REMESH_BURST_TEST
+/* Lay REMESH_BURST_BLOCKS blocks in one frame through the deferred path. A
+ * stride-2 lattice around the player rather than a compact slab: the point is
+ * to dirty several dozen chunks, which is what a proxy join-time diff does and
+ * what makes the nearest-first flush ordering observable (the lattice fills in
+ * from under the player outwards over the following frames).
+ *
+ * Alternating two block ids also exercises the post-load dedup_tex append --
+ * whichever of them the map does not already contain arrives as a new texcoord
+ * against a display list that was recorded at load time. */
+static struct {
+	int   edits;        /* blocks that actually changed                      */
+	int   peakDirty;    /* chunks the burst marked, before any flush          */
+	int   frames;       /* rendered frames until the queue drained            */
+	int   converged;
+	float editMs;       /* the World_SetBlockDeferred calls alone             */
+	u32   heapBefore, heapAfter;
+} g_burst;
+
+static void RemeshBurst(World *w, const Player *p, int dy) {
+	int side = 1;
+	while (side * side < REMESH_BURST_BLOCKS) side++;
+	int bx0 = (int)floor(p->x) - side;
+	int bz0 = (int)floor(p->z) - side;
+	int by  = (int)floor(p->y) + dy;
+
+	g_burst.edits = 0;
+	g_burst.frames = 0;
+	g_burst.converged = 0;
+	g_burst.heapBefore = Hud_HeapUsed();
+	u64 t0 = gettime();
+	int n = 0, i, j;
+	for (i = 0; i < side && n < REMESH_BURST_BLOCKS; i++)
+		for (j = 0; j < side && n < REMESH_BURST_BLOCKS; j++, n++)
+			g_burst.edits += World_SetBlockDeferred(w, bx0 + i * 2, by,
+			                                        bz0 + j * 2,
+			                                        ((i ^ j) & 1) ? 410 : 132);
+	g_burst.editMs = (float)ticks_to_microsecs(gettime() - t0) / 1000.0f;
+
+	WorldStats st;
+	World_GetStats(w, &st);
+	g_burst.peakDirty = (int)st.dirtyChunks;
+}
+
+/* Two lines under the perf panel with what the overlay's own rolling numbers
+ * cannot show: how the burst frame split between edits and re-mesh, how many
+ * rendered frames the queue took to drain, and whether the heap came back. */
+static void RemeshBurstReport(int fbWidth, int efbHeight) {
+	char line[80];
+	Hud_Begin2D(fbWidth, efbHeight);
+	snprintf(line, sizeof line, "burst %d edits %d ch in %d.%01d ms",
+	         g_burst.edits, g_burst.peakDirty,
+	         (int)g_burst.editMs, ((int)(g_burst.editMs * 10.0f)) % 10);
+	Hud_DrawStringShadow(line, 2, 9 * 8 + 6, 0x55FF55FFu);
+	snprintf(line, sizeof line, "converged %d fr  heap %+dK",
+	         g_burst.frames,
+	         ((int)g_burst.heapAfter - (int)g_burst.heapBefore) / 1024);
+	Hud_DrawStringShadow(line, 2, 9 * 9 + 6,
+	                     g_burst.converged ? 0x55FF55FFu : 0xFFAA00FFu);
+	Hud_End2D();
+}
+#endif
+
 static u32 CountEntities(const ItemWorld *iw) {
 	u32 n = 0;
 	int i;
@@ -270,6 +370,9 @@ static void RunWorld(World *w, u32 curr) {
 	float alpha = 0.0f;   /* inter-tick fraction, for interpolated rendering */
 #if INTERACT_TEST_MODE
 	int testFrame = 0;
+#endif
+#if REMESH_BURST_TEST
+	int burstFrame = 0;
 #endif
 
 	Player_Spawn(&player, w);
@@ -365,6 +468,20 @@ static void RunWorld(World *w, u32 curr) {
 			SetTourCamera(&cam, tourIdx);
 		}
 
+#if REMESH_BURST_TEST
+		/* Two bursts, at different heights so the second is genuinely new work.
+		 * The first is a warm-up whose numbers are thrown away: under Dolphin
+		 * the very first deferred flush also pays to JIT-compile a path the
+		 * load-time mesh never takes (pad_fill's edit-overlay branch, which
+		 * only runs once World.editCount is non-zero), and that one-time cost
+		 * is not something a real GameCube would pay. The maxima are reset in
+		 * between, so what the overlay reports is the steady-state cost. */
+		++burstFrame;
+		if (burstFrame == 120) RemeshBurst(w, &player, 8);
+		if (burstFrame == 300) { World_ResetStatsMax(w); Hud_PerfInit(&perf); }
+		if (burstFrame == 301) RemeshBurst(w, &player, 12);
+#endif
+
 		u64 nowTB = gettime();
 		double dtUs = (double)ticks_to_microsecs(nowTB - prevTB);
 		prevTB = nowTB;
@@ -392,6 +509,26 @@ static void RunWorld(World *w, u32 curr) {
 			alpha = (float)(accum / TICK_US);
 			Player_GetViewMatrix(&player, alpha, v);
 		}
+
+		/* Drain the deferred re-mesh queue (T24) before drawing, so a chunk
+		 * rebuilt this frame is the one submitted this frame. Nearest-first
+		 * from the player, or the camera when it has been detached. */
+		int stillDirty = World_FlushRemesh(w, REMESH_PER_FRAME,
+		                  freecam ? cam.pos.x / WORLD_BLOCK_SIZE : player.x,
+		                  freecam ? cam.pos.z / WORLD_BLOCK_SIZE : player.z);
+		(void)stillDirty;
+#if REMESH_BURST_TEST
+		/* Frames from the burst until the queue drains, and whether the heap
+		 * came back to what it was: T24 budgets convergence at ~30 frames with
+		 * no arena growth, and neither is visible in a rolling average. */
+		if (burstFrame >= 301 && !g_burst.converged) {
+			g_burst.frames++;
+			if (!stillDirty) {
+				g_burst.converged = 1;
+				g_burst.heapAfter = Hud_HeapUsed();
+			}
+		}
+#endif
 
 		GX_SetViewport(0, 0, rmode->fbWidth, rmode->efbHeight, 0, 1);
 		GX_InvVtxCache();
@@ -430,6 +567,10 @@ static void RunWorld(World *w, u32 curr) {
 		 * mark stay honest across a toggle. */
 		Hud_PerfSample(&perf, dtUs, tickUs, w, CountEntities(&items));
 		if (perfOn) Hud_DrawPerf(&perf, rmode->fbWidth, rmode->efbHeight);
+#if REMESH_BURST_TEST
+		if (burstFrame >= 301)
+			RemeshBurstReport(rmode->fbWidth, rmode->efbHeight);
+#endif
 		/* Draws nothing until the network has been brought up, so this costs
 		 * offline play a branch and gives network mode (T11) the indicator
 		 * already in place. */
@@ -445,6 +586,185 @@ static void RunWorld(World *w, u32 curr) {
 		VIDEO_WaitVSync();
 		curr ^= 1;
 	}
+}
+
+/* ---- network mode (T11) --------------------------------------------------
+ * Milestone 1: connect, load whichever map the server is running, and watch a
+ * live game. The console draws and does not act -- no movement is sent, which
+ * is the single decision that keeps this milestone free of the kick risk that
+ * T22 exists to manage.
+ *
+ * The camera is camera.c's free-fly, parked on the proxy account's position
+ * the first time the server teleports it. That is the right spectator camera
+ * and it is already written; a first-person one would need the movement path
+ * this milestone deliberately does not have. */
+
+/* Bring the Broadband Adapter up, on the libogc console so a DHCP failure is
+ * readable rather than a black screen. if_config blocks for up to `retries`
+ * attempts and cannot be made asynchronous, so it happens here -- at the point
+ * the player asked for multiplayer -- rather than in front of every offline
+ * boot. */
+static int NetBringUp(void) {
+	if (Net_GetState() != NET_DOWN) return 1;
+
+	console_init(xfb[0], 0, 0, rmode->fbWidth, rmode->xfbHeight,
+	             rmode->fbWidth * 2);
+	VIDEO_SetNextFramebuffer(xfb[0]);
+	VIDEO_Flush();
+
+	printf("\x1b[2J\x1b[1;1H  MEGA SKYWARS  -  multiplayer\n\n");
+	printf("  bringing up the broadband adapter (DHCP)...\n");
+	if (!Net_Init(20)) {
+		printf("\n  FAILED: %s\n", Net_LastError());
+		printf("  In Dolphin: Config > GameCube > SP1 > Broadband Adapter.\n");
+		printf("\n  Press Start to go back.\n");
+		while (1) {
+			VIDEO_WaitVSync();
+			PAD_ScanPads();
+			if (PAD_ButtonsDown(0) & PAD_BUTTON_START) return 0;
+		}
+	}
+	printf("  ip %s  gateway %s\n", Net_LocalIp(), Net_Gateway());
+	printf("  dialling %s:%d ...\n", NET_PROXY_IP, GCLINK_PORT);
+	return 1;
+}
+
+static void RunNetwork(u32 curr) {
+	NetGame ng;
+	Camera  cam;
+	World   world;
+	HudPerf perf;
+	HudTag  tags[HUD_TAG_MAX];
+	Mtx     v;
+	int   haveWorld = 0;
+	int   camSeeded = 0;
+	int   perfOn = PERF_HUD;
+	float alpha = 0.0f;
+	NetState lastState = NET_DOWN;
+
+	NetGame_Init(&ng);
+	Hud_PerfInit(&perf);
+	Camera_Init(&cam, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+	Net_Connect(NET_PROXY_IP, GCLINK_PORT);
+
+	u64 prevTB = gettime();
+	double accum = 0.0;
+
+	while (SYS_MainLoop()) {
+		PAD_ScanPads();
+		u32 down = PAD_ButtonsDown(0);
+		u32 held = PAD_ButtonsHeld(0);
+		if (down & PAD_BUTTON_START) break;
+		if (down & PAD_BUTTON_Y) Net_Reconnect();
+		if (down & PAD_BUTTON_DOWN) {
+			perfOn = !perfOn;
+			if (perfOn) {
+				Hud_PerfInit(&perf);
+				if (haveWorld) World_ResetStatsMax(&world);
+			}
+		}
+		/* Z holds the chat log open -- T23's binding, in place from here so
+		 * the hidden-by-default log is testable in this milestone rather than
+		 * three tasks later. */
+		ng.hud.show = (held & PAD_TRIGGER_Z) != 0;
+
+		/* A reconnect makes the proxy restate everything (world, then state,
+		 * then entities), so the table has to be empty first: anything that
+		 * died while the link was down would otherwise stand there forever. */
+		NetState st = Net_GetState();
+		if (st == NET_READY && lastState != NET_READY) NetGame_Reset(&ng);
+		lastState = st;
+
+		/* Drain the link. A pending map change stops the drain, so the
+		 * join-time block diff behind it is applied to the right world. */
+		if (NetGame_Poll(&ng, haveWorld ? &world : NULL)) {
+			int idx = ng.wantMap;
+			if (haveWorld) { World_Free(&world); haveWorld = 0; }
+			u32 size = (u32)(g_maps[idx].end - g_maps[idx].data);
+			haveWorld = World_Load(&world, g_maps[idx].data, size);
+			/* Marked loaded either way: a map that will not load is not going
+			 * to load on the next frame either, and retrying it every frame
+			 * would wedge the drain instead of just missing the geometry. */
+			NetGame_MapLoaded(&ng, idx);
+			camSeeded = 0;
+		}
+
+		/* Park the camera on the account the proxy is logged in as, once per
+		 * map. After that it is the player's to fly; X re-centres it. */
+		if (ng.tpPending && (!camSeeded || (down & PAD_BUTTON_X))) {
+			Camera_Init(&cam,
+			            (float)(ng.tpX * WORLD_BLOCK_SIZE),
+			            (float)((ng.tpY + 1.62) * WORLD_BLOCK_SIZE),
+			            (float)(ng.tpZ * WORLD_BLOCK_SIZE),
+			            ng.tpYaw, ng.tpPitch);
+			camSeeded = 1;
+		}
+
+		u64 nowTB = gettime();
+		double dtUs = (double)ticks_to_microsecs(nowTB - prevTB);
+		prevTB = nowTB;
+
+		accum += dtUs;
+		if (accum > MAX_ACCUM_US) accum = MAX_ACCUM_US;
+		u64 tickTB = gettime();
+		while (accum >= TICK_US) { NetGame_Tick(&ng); accum -= TICK_US; }
+		double tickUs = (double)ticks_to_microsecs(gettime() - tickTB);
+		alpha = (float)(accum / TICK_US);
+
+		Camera_Update(&cam, 0);
+		Camera_GetViewMatrix(&cam, v);
+
+		double eyeX = cam.pos.x / WORLD_BLOCK_SIZE;
+		double eyeY = cam.pos.y / WORLD_BLOCK_SIZE;
+		double eyeZ = cam.pos.z / WORLD_BLOCK_SIZE;
+
+		if (haveWorld) World_FlushRemesh(&world, REMESH_PER_FRAME, eyeX, eyeZ);
+
+		GX_SetViewport(0, 0, rmode->fbWidth, rmode->efbHeight, 0, 1);
+		GX_InvVtxCache();
+		GX_InvalidateTexAll();
+		GX_LoadProjectionMtx(g_proj, GX_PERSPECTIVE);
+
+		if (haveWorld) World_Draw(&world, v);
+		Entity_Draw(&ng.ents, v, alpha);
+
+		int nTags = Entity_CollectTags(&ng.ents, haveWorld ? &world : NULL,
+		                               v, g_proj, eyeX, eyeY, eyeZ,
+		                               rmode->fbWidth, rmode->efbHeight,
+		                               tags, HUD_TAG_MAX);
+		Hud_DrawTags(tags, nTags, rmode->fbWidth, rmode->efbHeight);
+		Hud_DrawNetOverlay(&ng.hud, rmode->fbWidth, rmode->efbHeight);
+
+		if (!haveWorld) {
+			/* Nothing on screen is ambiguous between "connecting", "the proxy
+			 * is in the lobby" and "something is broken"; say which. */
+			HudScreen sc = Hud_Begin2D(rmode->fbWidth, rmode->efbHeight);
+			const char *msg = (st != NET_READY) ? "connecting to the proxy..."
+			                : "waiting for a map (the account is in the lobby)";
+			Hud_DrawStringShadow(msg,
+			                     (int)(sc.w / 2) - Hud_StringWidth(msg) / 2,
+			                     (int)(sc.h / 2) - 4, 0xFFFFFFFFu);
+			Hud_End2D();
+		}
+
+		Hud_PerfSample(&perf, dtUs, tickUs, haveWorld ? &world : NULL,
+		               Entity_Count(&ng.ents));
+		if (perfOn) Hud_DrawPerf(&perf, rmode->fbWidth, rmode->efbHeight);
+		Hud_DrawNetStatus(rmode->fbWidth, rmode->efbHeight);
+
+		GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
+		GX_SetColorUpdate(GX_TRUE);
+		GX_CopyDisp(xfb[curr], GX_TRUE);
+		GX_DrawDone();
+
+		VIDEO_SetNextFramebuffer(xfb[curr]);
+		VIDEO_Flush();
+		VIDEO_WaitVSync();
+		curr ^= 1;
+	}
+
+	Net_Disconnect(NULL);
+	if (haveWorld) World_Free(&world);
 }
 
 int main(int argc, char **argv) {
@@ -499,12 +819,18 @@ int main(int argc, char **argv) {
 	World_InitGX();
 	Hud_InitGX();
 	HeldItem_InitGX();
+	Entity_InitGX();
 
 #if MAP_AUDIT_MODE
 	MapAudit();   /* never returns */
 #endif
 #if NET_TEST_MODE
 	NetTest();
+	return 0;
+#endif
+
+#if NET_AUTOLOAD
+	if (NetBringUp()) RunNetwork(0);
 	return 0;
 #endif
 
@@ -533,7 +859,14 @@ int main(int argc, char **argv) {
 		static volatile int autoloadIndex = TEST_AUTOLOAD;
 		int sel = autoloadIndex;
 #else
-		int sel = Menu_Run(g_maps, MAP_COUNT, xfb[0], rmode);
+		char netTarget[32];
+		snprintf(netTarget, sizeof netTarget, "%s:%d",
+		         NET_PROXY_IP, GCLINK_PORT);
+		int sel = Menu_Run(g_maps, MAP_COUNT, xfb[0], rmode, netTarget);
+		if (sel == MENU_NETWORK) {
+			if (NetBringUp()) RunNetwork(0);
+			continue;
+		}
 		if (sel < 0) break;
 #endif
 

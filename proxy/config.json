@@ -1,0 +1,72 @@
+{
+  "_comment": [
+    "Defaults, committed. Put anything account-specific in config.local.json",
+    "beside this file -- it is gitignored and shallow-merged over these values,",
+    "so your username never lands in a commit. Command-line flags win over both."
+  ],
+
+  "server": {
+    "host": "localhost",
+    "port": 25565,
+    "version": "1.8.9",
+    "username": "",
+    "_username": [
+      "The Microsoft account email. It is only a cache key -- the first run",
+      "prints a device code to sign in with, and the token is cached under",
+      "profilesFolder from then on."
+    ],
+    "_auth": [
+      "There is no auth setting. This proxy signs in to a real account, always;",
+      "the offline mode that would let it join without one is not exposed here."
+    ],
+    "profilesFolder": ".mcauth",
+    "_ranked": [
+      "The ranked queue requires ViaVersion protocol 47, which a real 1.8.9",
+      "client is; casual has no version check either way. Do not bump this."
+    ]
+  },
+
+  "gclink": {
+    "host": "0.0.0.0",
+    "port": 25566,
+    "pingIntervalMs": 1000
+  },
+
+  "world": {
+    "mapMatchRadius": 250,
+    "_mapMatchRadius": [
+      "Maps sit >= 1800 blocks apart, so anything this side of a few hundred",
+      "blocks from an origin is unambiguously that map. Beyond every origin is",
+      "the hub, which is GCLINK_GAME_LOBBY and has no geometry we can show."
+    ],
+    "maxBlocksPerFrame": 4096,
+    "_maxBlocksPerFrame": [
+      "Join-time chunk diffs run to tens of thousands of blocks. The console",
+      "re-meshes a bounded number of chunks per frame (T24), so pace the deltas",
+      "rather than handing TCP a megabyte and hoping."
+    ]
+  },
+
+  "entities": {
+    "cap": 128,
+    "updateHz": 20,
+    "minMoveDelta": 0.03,
+    "_cap": "16 players + arrows + snowballs + a 192-stone death drop overflows 64."
+  },
+
+  "chat": {
+    "log": true,
+    "sendBorderSize": true,
+    "_sendBorderSize": [
+      "MegaSkywars renders the Wall of Death as per-player particles only, so it",
+      "is invisible to the console. /bordersize opts into a server-sent action",
+      "bar with the live radius -- the readout is free and exact, where",
+      "predicting 175 - 0.4t is neither."
+    ]
+  },
+
+  "log": {
+    "level": "info",
+    "packets": false
+  }
+}

@@ -19,6 +19,10 @@
 #define INV_ARMOR_SIZE  4    /* armorInventory                          */
 #define INV_STACK_LIMIT 64   /* getInventoryStackLimit()                */
 
+/* Every addressable slot: the index space Inventory_GetStackInSlot and
+ * Inventory_SetSlot take, and the one the proxy's INV_SET already speaks. */
+#define INV_TOTAL_SIZE  (INV_MAIN_SIZE + INV_ARMOR_SIZE)
+
 /* One stack. stackSize (count) == 0 is the empty/"null ItemStack" sentinel --
  * item is then meaningless (kept as -1). item is a block global id; meta is the
  * block data value, retained for fidelity with ItemStack.itemDamage even though
@@ -55,6 +59,12 @@ ItemStack *Inventory_GetCurrentItem(Inventory *inv);
 /* changeCurrentItem(direction): scroll the hotbar. direction > 0 selects the
  * slot to the left (decreasing index), < 0 to the right, wrapping 0..8. */
 void Inventory_ChangeCurrentItem(Inventory *inv, int direction);
+
+/* Select a hotbar slot outright. The server's S09 is absolute where
+ * changeCurrentItem is relative, and a relative setter cannot express "the
+ * server says you are now holding slot 4" without knowing what the console
+ * currently believes -- which, after any desync, it does not. */
+void Inventory_SetCurrentItem(Inventory *inv, int slot);
 
 /* getFirstEmptyStack(): index of the first empty main slot, or -1. */
 int Inventory_GetFirstEmptyStack(Inventory *inv);

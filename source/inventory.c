@@ -45,6 +45,11 @@ void Inventory_ChangeCurrentItem(Inventory *inv, int direction) {
 		inv->currentItem -= 9;
 }
 
+void Inventory_SetCurrentItem(Inventory *inv, int slot) {
+	if (slot < 0 || slot >= INV_HOTBAR_SIZE) return;
+	inv->currentItem = slot;
+}
+
 /* getInventoryStackLimit() capped by the item's own getMaxStackSize(): 64 for
  * blocks and loose items, 1 for tools (which is also what makes them fail
  * ItemStack.isStackable, so they never merge). */

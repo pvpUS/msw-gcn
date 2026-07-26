@@ -8,7 +8,8 @@
 #define STICK_THRESH 42
 #define STICK_REPEAT 7
 
-static void DrawList(const MapEntry *maps, int count, int sel, int top) {
+static void DrawList(const MapEntry *maps, int count, int sel, int top,
+                     const char *netTarget) {
 	printf("\x1b[2J\x1b[1;1H");
 	printf("  MEGA SKYWARS  -  GameCube voxel worlds\n");
 	printf("  ======================================\n\n");
@@ -30,9 +31,15 @@ static void DrawList(const MapEntry *maps, int count, int sel, int top) {
 	if (count > VISIBLE)
 		printf("  (%d-%d of %d)\n", top + 1,
 		       (top + VISIBLE < count) ? top + VISIBLE : count, count);
+	/* Multiplayer is one keypress rather than a list row: the maps above are
+	 * an offline sandbox and this is a different mode entirely -- it dials a
+	 * proxy, and which map loads is the server's decision, not the player's. */
+	if (netTarget)
+		printf("\n  Y: connect and spectate  ->  %s\n", netTarget);
 }
 
-int Menu_Run(const MapEntry *maps, int count, void *xfb, GXRModeObj *rmode) {
+int Menu_Run(const MapEntry *maps, int count, void *xfb, GXRModeObj *rmode,
+             const char *netTarget) {
 	/* full-screen console so no uninitialised framebuffer shows at the edges */
 	console_init(xfb, 0, 0, rmode->fbWidth, rmode->xfbHeight,
 	             rmode->fbWidth * 2);
@@ -41,7 +48,7 @@ int Menu_Run(const MapEntry *maps, int count, void *xfb, GXRModeObj *rmode) {
 
 	int sel = 0, top = 0;
 	int stickCooldown = 0;
-	DrawList(maps, count, sel, top);
+	DrawList(maps, count, sel, top, netTarget);
 
 	while (1) {
 		VIDEO_WaitVSync();
@@ -65,12 +72,13 @@ int Menu_Run(const MapEntry *maps, int count, void *xfb, GXRModeObj *rmode) {
 		if (sel >= count) sel = 0;
 
 		if (down & PAD_BUTTON_A)     return sel;
-		if (down & PAD_BUTTON_START) return -1;
+		if (down & PAD_BUTTON_START) return MENU_QUIT;
+		if (netTarget && (down & PAD_BUTTON_Y)) return MENU_NETWORK;
 
 		if (sel < top) top = sel;
 		if (sel >= top + VISIBLE) top = sel - VISIBLE + 1;
 
 		if (sel != prevSel)
-			DrawList(maps, count, sel, top);
+			DrawList(maps, count, sel, top, netTarget);
 	}
 }

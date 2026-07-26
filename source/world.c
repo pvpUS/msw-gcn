@@ -83,9 +83,6 @@ static const u8 faceUAxis[6] = { 2, 2, 0, 0, 0, 0 };
 static const u8 faceUFlip[6] = { 0, 1, 0, 0, 1, 0 };
 static const u8 faceVAxis[6] = { 1, 1, 2, 2, 1, 1 };
 static const u8 faceVFlip[6] = { 1, 1, 0, 1, 1, 1 };
-static const int faceNormal[6][3] = {
-	{-1,0,0},{1,0,0},{0,-1,0},{0,1,0},{0,0,-1},{0,0,1},
-};
 /* Minecraft-style directional ambient shade per face. */
 static const u8 faceShade[6] = { 153, 153, 128, 255, 204, 204 };
 
@@ -179,38 +176,111 @@ int World_InBounds(const World *w, int bx, int by, int bz) {
 	return to_grid(w, bx, by, bz, &gx, &gy, &gz);
 }
 
+/* Newest staged value for `key`, or 0 if it isn't staged. Backwards, so the
+ * last write wins even though edit_stage never actually leaves a duplicate. */
+static int pend_find(const World *w, u32 key, int *id) {
+	u32 i;
+	for (i = w->pendCount; i > 0; i--)
+		if (w->pendIdx[i - 1] == key) { *id = w->pendId[i - 1]; return 1; }
+	return 0;
+}
+
 int World_GetBlock(const World *w, int bx, int by, int bz) {
 	int gx, gy, gz;
 	if (!w->colStart || !to_grid(w, bx, by, bz, &gx, &gy, &gz)) return -1;
-	if (w->editCount) {
+	if (w->editCount || w->pendCount) {
 		u32 key = vox_index(w, gx, gy, gz);
+		int staged;
+		/* Staged edits are newer than merged ones, so they are consulted
+		 * first. Both are usually empty, and the staging buffer is only ever
+		 * non-empty part-way through a batch. */
+		if (w->pendCount && pend_find(w, key, &staged)) return staged;
 		u32 i = edit_lower(w, key);
 		if (i < w->editCount && w->editIdx[i] == key) return w->editId[i];
 	}
 	return base_block(w, gx, gy, gz);
 }
 
-/* Insert/replace an edit-overlay entry, keeping editIdx[] sorted. Returns 0 if
- * the entry could not be recorded, so the caller can report the edit as having
- * failed rather than leaving the world and its mesh disagreeing. */
-static int edit_put(World *w, u32 key, int id) {
-	u32 i = edit_lower(w, key);
-	if (i < w->editCount && w->editIdx[i] == key) { w->editId[i] = (s16)id; return 1; }
-	if (w->editCount == w->editCap) {
-		u32 cap = w->editCap ? w->editCap * 2 : 256;
-		u32 *ni = realloc(w->editIdx, cap * sizeof(u32));
-		if (!ni) return 0;
-		w->editIdx = ni;
-		s16 *nd = realloc(w->editId, cap * sizeof(s16));
-		if (!nd) return 0;   /* editIdx is simply over-allocated; still valid */
-		w->editId = nd;
-		w->editCap = cap;
+/* Grow the merged overlay to hold at least `need` entries. */
+static int edit_reserve(World *w, u32 need) {
+	if (need <= w->editCap) return 1;
+	u32 cap = w->editCap ? w->editCap : 256;
+	while (cap < need) cap *= 2;
+	u32 *ni = realloc(w->editIdx, cap * sizeof(u32));
+	if (!ni) return 0;
+	w->editIdx = ni;
+	s16 *nd = realloc(w->editId, cap * sizeof(s16));
+	if (!nd) return 0;   /* editIdx is simply over-allocated; still valid */
+	w->editId = nd;
+	w->editCap = cap;
+	return 1;
+}
+
+/* Merge the staging buffer into the sorted overlay in one pass, newest wins.
+ * Capacity was reserved when each entry was staged, so this cannot fail. */
+static void edit_merge_pending(World *w) {
+	u32 n = w->pendCount, i, j, a, b, d, dup = 0;
+	if (!n) return;
+
+	/* Sort the staging buffer. Insertion sort because a block batch arrives in
+	 * roughly ascending voxel order (the proxy walks chunk sections), which is
+	 * this sort's best case, and n is bounded by EDIT_PEND_MAX. */
+	for (i = 1; i < n; i++) {
+		u32 k = w->pendIdx[i];
+		s16 v = w->pendId[i];
+		for (j = i; j > 0 && w->pendIdx[j - 1] > k; j--) {
+			w->pendIdx[j] = w->pendIdx[j - 1];
+			w->pendId[j]  = w->pendId[j - 1];
+		}
+		w->pendIdx[j] = k; w->pendId[j] = v;
 	}
-	memmove(&w->editIdx[i + 1], &w->editIdx[i], (w->editCount - i) * sizeof(u32));
-	memmove(&w->editId[i + 1],  &w->editId[i],  (w->editCount - i) * sizeof(s16));
-	w->editIdx[i] = key;
-	w->editId[i] = (s16)id;
-	w->editCount++;
+
+	/* Keys present in both overwrite rather than extend, so count them first:
+	 * the merge below runs backwards and needs to know where the end lands. */
+	for (a = 0, b = 0; a < w->editCount && b < n; ) {
+		if      (w->editIdx[a] < w->pendIdx[b]) a++;
+		else if (w->editIdx[a] > w->pendIdx[b]) b++;
+		else { dup++; a++; b++; }
+	}
+
+	a = w->editCount; b = n; d = w->editCount + n - dup;
+	w->editCount = d;
+	while (b > 0) {
+		if (a > 0 && w->editIdx[a - 1] > w->pendIdx[b - 1]) {
+			a--; d--;
+			w->editIdx[d] = w->editIdx[a]; w->editId[d] = w->editId[a];
+		} else {
+			if (a > 0 && w->editIdx[a - 1] == w->pendIdx[b - 1]) a--;
+			b--; d--;
+			w->editIdx[d] = w->pendIdx[b]; w->editId[d] = w->pendId[b];
+		}
+	}
+	w->pendCount = 0;
+}
+
+/* Stage an edit. Returns 0 if it could not be recorded, so the caller can
+ * report the edit as having failed rather than leaving the world and its mesh
+ * disagreeing.
+ *
+ * Inserting straight into the sorted overlay costs an O(editCount) memmove
+ * every time, which is invisible for single-player mining and ruinous for a
+ * batch: 2000 deltas into a 4000-entry overlay measured at 57 ms in one frame,
+ * three dropped fields before a single chunk had been re-meshed -- and it grows
+ * as a game accumulates edits. Staging turns that into an append plus a merge
+ * every EDIT_PEND_MAX entries. The two costs (scanning the staging buffer per
+ * edit, merging it per fill) balance around EDIT_PEND_MAX = sqrt(2*editCount),
+ * which for the few thousand edits a game produces is the order of 128. */
+static int edit_put(World *w, u32 key, int id) {
+	u32 i;
+	for (i = w->pendCount; i > 0; i--)
+		if (w->pendIdx[i - 1] == key) { w->pendId[i - 1] = (s16)id; return 1; }
+
+	/* Reserve the merged capacity now rather than at merge time: an edit that
+	 * World_GetBlock has already started reporting must not then fail to land. */
+	if (!edit_reserve(w, w->editCount + w->pendCount + 1)) return 0;
+	w->pendIdx[w->pendCount] = key;
+	w->pendId[w->pendCount]  = (s16)id;
+	if (++w->pendCount >= WORLD_EDIT_PEND_MAX) edit_merge_pending(w);
 	return 1;
 }
 
@@ -278,13 +348,22 @@ int World_BlockSolid(const World *w, int bx, int by, int bz) {
  * address, so POS can stay direct and no per-chunk vertex splitting is needed.
  * Both arrays are append-only and shared by every chunk, so re-meshing one
  * chunk can add entries without invalidating indices already baked into
- * another chunk's list. */
+ * another chunk's list.
+ *
+ * Append-only is also why both have a hard index ceiling, and why each one
+ * refuses to append past it rather than letting the cast wrap: a wrapped index
+ * would alias an existing entry, so a chunk re-meshed late in a session would
+ * silently draw with some other tile's texcoords -- a corruption that would
+ * look like a meshing bug and be traced nowhere near here. Aliasing entry 0
+ * instead is just as wrong on screen, but it is bounded, and the counters are
+ * on the perf overlay so the approach to the ceiling is visible first. */
 static u8 dedup_clr(World *w, u8 r, u8 g, u8 b, u8 a) {
 	u32 i;
 	for (i = 0; i < w->clrCount; i++) {
 		const u8 *c = &w->clrArr[i * 4];
 		if (c[0] == r && c[1] == g && c[2] == b && c[3] == a) return (u8)i;
 	}
+	if (w->clrCount >= 256) return 0;  /* GX_INDEX8 addresses 256 shades */
 	if (w->clrCount == w->clrCap) {
 		u32 cap = w->clrCap ? w->clrCap * 2 : 16;
 		u8 *n = memalign(32, (cap * 4 + 31) & ~31u);
@@ -328,6 +407,7 @@ static u16 dedup_tex(World *w, u16 s, u16 t) {
 		if (w->texKey[h] == key) return w->texVal[h];
 		h = (h + 1) & w->texMask;
 	}
+	if (w->texCount >= 65535) return 0;   /* GX_INDEX16 */
 	if (w->texCount == w->texCap) {
 		u32 cap = w->texCap ? w->texCap * 2 : 1024;
 		u16 *n = memalign(32, (cap * 4 + 31) & ~31u);
@@ -343,13 +423,96 @@ static u16 dedup_tex(World *w, u16 s, u16 t) {
 	return idx;
 }
 
+/* ---- whole-tile texcoord cache --------------------------------------------
+ * Nearly every quad maps a *whole* atlas tile onto its face: every full-cube
+ * face does, and so does every custom-shape box face that spans its tile on
+ * both axes. For those the four texcoord indices are a pure function of the
+ * tile, so they are worth resolving once per tile instead of once per vertex.
+ *
+ * Without this, each quad cost four uv_raw float->u16 conversions and four
+ * dedup_tex hash probes -- in the count pass *and* again in the emit pass,
+ * which is why the two used to measure within 15% of each other despite only
+ * one of them writing any vertices. The maps here have on the order of a
+ * hundred distinct tiles (the perf overlay's `tex` counter, /4), so the hash
+ * is now touched about that many times per world instead of four times per
+ * quad per pass.
+ *
+ * Entries are indices into World.texArr, which World_Free discards, so the
+ * cache records which World filled it and is dropped when that changes --
+ * `World world;` in main.c is a stack local, so a second map can genuinely
+ * land on the same address with a different texArr behind it. */
+#define ATLAS_TILES (ATLAS_COLS * (ATLAS_TEX_H / ATLAS_CELL))
+
+static const World *tileCacheOwner;
+static u16 tileCorner[ATLAS_TILES][4];   /* indexed uBit*2 + vBit */
+static u8  tileCached[ATLAS_TILES];
+
+static void tile_cache_reset(const World *w) {
+	memset(tileCached, 0, sizeof tileCached);
+	tileCacheOwner = w;
+}
+
+/* Cold half: resolve a tile the cache hasn't seen. A tile outside the atlas
+ * folds onto tile 0 rather than reading off the end -- the same bounded-and-
+ * visible failure clamp_block_id chooses, and it should already have made this
+ * unreachable. */
+static const u16 *tile_corners_fill(World *w, int tile) {
+	if ((unsigned)tile >= ATLAS_TILES) tile = 0;
+	u16 *c = tileCorner[tile];
+	if (!tileCached[tile]) {
+		int col = tile % ATLAS_COLS, row = tile / ATLAS_COLS;
+		int px0 = col * ATLAS_CELL + ATLAS_PAD;
+		int py0 = row * ATLAS_CELL + ATLAS_PAD;
+		u16 u0 = uv_raw((float)px0, ATLAS_TEX_W);
+		u16 u1 = uv_raw((float)(px0 + ATLAS_TILE), ATLAS_TEX_W);
+		u16 v0 = uv_raw((float)py0, ATLAS_TEX_H);
+		u16 v1 = uv_raw((float)(py0 + ATLAS_TILE), ATLAS_TEX_H);
+		c[0] = dedup_tex(w, u0, v0); c[1] = dedup_tex(w, u0, v1);
+		c[2] = dedup_tex(w, u1, v0); c[3] = dedup_tex(w, u1, v1);
+		tileCached[tile] = 1;
+	}
+	return c;
+}
+
+/* The four deduped texcoord indices at `tile`'s corners, in the same
+ * uBit*2 + vBit order the faceUV table selects with. A hit is a bounds test
+ * and a byte load, which is what the count pass reduces to per quad. */
+static inline const u16 *tile_corners(World *w, int tile) {
+	if ((unsigned)tile < ATLAS_TILES && tileCached[tile]) return tileCorner[tile];
+	return tile_corners_fill(w, tile);
+}
+
+/* Cube-face corner offsets in sixteenths, and the tile corner each vertex
+ * takes -- faceVerts pre-multiplied and faceUV pre-combined, so the full-cube
+ * path doesn't re-derive either per vertex. Built from the tables above rather
+ * than written out again, so the two cannot drift apart. */
+static s16 cubeVert[6][4][3];
+static u8  cubeCorner[6][4];
+
+static void cube_tables_init(void) {
+	int f, v, a;
+	for (f = 0; f < 6; f++)
+		for (v = 0; v < 4; v++) {
+			for (a = 0; a < 3; a++)
+				cubeVert[f][v][a] = (s16)(faceVerts[f][v][a] * 16);
+			cubeCorner[f][v] = (u8)(faceUV[f][v][0] * 2 + faceUV[f][v][1]);
+		}
+}
+
 /* ---- mesh emission ----------------------------------------------------- */
 
 typedef struct {
 	World *w;
 	u32 faceCount;   /* total for this chunk (known after the count pass) */
 	u32 faceIdx;     /* running index while emitting                      */
+	u32 batchLeft;   /* quads still owed to the open GX_Begin; 0 = none open */
 	int emit;        /* 0 = count, 1 = emit                               */
+	/* Colour indices for the six face shades and for the unshaded quads,
+	 * resolved once per chunk. dedup_clr is a linear scan, and running it per
+	 * quad put it on the hot path for no reason -- there are only ever four
+	 * distinct shades in the whole palette. */
+	u8  clr[6];
+	u8  clrWhite;
 } FaceCtx;
 
 /* Shared quad emitter for both the full-cube path and BlockShape_Mesh's
@@ -361,11 +524,6 @@ typedef struct {
 static void emit_quad(FaceCtx *fc, int vx, int vy, int vz, int face,
                       s16 x0, s16 y0, s16 z0, s16 x1, s16 y1, s16 z1,
                       int tile, u8 whole) {
-	int col = tile % ATLAS_COLS;
-	int row = tile / ATLAS_COLS;
-	int px0 = col * ATLAS_CELL + ATLAS_PAD;   /* tile's top-left interior texel */
-	int py0 = row * ATLAS_CELL + ATLAS_PAD;
-
 	/* Texture crop in tile texels (0..ATLAS_TILE), from the box's projection
 	 * onto this face: block-model coords are sixteenths of a block and tiles
 	 * are ATLAS_TILE(=16) texels, so a box edge in sixteenths is a texel edge
@@ -373,56 +531,101 @@ static void emit_quad(FaceCtx *fc, int vx, int vy, int vz, int face,
 	 * matching slice of its tile (slab side = lower half, thin trapdoor edge =
 	 * thin strip) rather than the whole tile stretched to fit -- matching
 	 * Minecraft's default model UVs. `whole` overrides this to the full tile
-	 * for boxes with a purpose-made crop (enchant-table book); full cubes take
-	 * the projected path but span 0..16, so it resolves to the whole tile too.
-	 * uLo/uHi and vLo/vHi are the texel offsets at the face's faceUV==0 / ==1
-	 * corners, honoring each axis's flip. */
+	 * for boxes with a purpose-made crop (enchant-table book).
+	 *
+	 * A box spanning its tile on both axes resolves to the whole tile anyway,
+	 * which is every full cube and most shape faces, so that case skips the
+	 * arithmetic entirely and reads the four corner indices out of the tile
+	 * cache. The flips don't need testing there: a full span maps to 0..16
+	 * either way round. */
 	s16 lo[3] = { x0, y0, z0 }, hi[3] = { x1, y1, z1 };
 	int ua = faceUAxis[face], va = faceVAxis[face];
-	int uLo, uHi, vLo, vHi;
-	if (whole) {
-		uLo = 0; uHi = ATLAS_TILE; vLo = 0; vHi = ATLAS_TILE;
-	} else {
-		uLo = faceUFlip[face] ? (ATLAS_TILE - hi[ua]) : lo[ua];
-		uHi = faceUFlip[face] ? (ATLAS_TILE - lo[ua]) : hi[ua];
-		vLo = faceVFlip[face] ? (ATLAS_TILE - hi[va]) : lo[va];
-		vHi = faceVFlip[face] ? (ATLAS_TILE - lo[va]) : hi[va];
-	}
-	u16 u0 = uv_raw(px0 + uLo, ATLAS_TEX_W), u1 = uv_raw(px0 + uHi, ATLAS_TEX_W);
-	u16 v0 = uv_raw(py0 + vLo, ATLAS_TEX_H), v1 = uv_raw(py0 + vHi, ATLAS_TEX_H);
-	u8 sh = faceShade[face];
-	u16 tu[4], tv[4];
+	const u16 *corner;      /* texcoord index per tile corner, uBit*2 + vBit */
+	u16 cropped[4];
 	int v;
-	for (v = 0; v < 4; v++) {
-		tu[v] = faceUV[face][v][0] ? u1 : u0;
-		tv[v] = faceUV[face][v][1] ? v1 : v0;
+
+	if (whole || (lo[ua] == 0 && hi[ua] == ATLAS_TILE &&
+	              lo[va] == 0 && hi[va] == ATLAS_TILE)) {
+		corner = tile_corners(fc->w, tile);
+	} else {
+		int col = tile % ATLAS_COLS, row = tile / ATLAS_COLS;
+		int px0 = col * ATLAS_CELL + ATLAS_PAD; /* tile's top-left interior texel */
+		int py0 = row * ATLAS_CELL + ATLAS_PAD;
+		/* uLo/uHi and vLo/vHi are the texel offsets at the face's faceUV==0 /
+		 * ==1 corners, honoring each axis's flip. */
+		int uLo = faceUFlip[face] ? (ATLAS_TILE - hi[ua]) : lo[ua];
+		int uHi = faceUFlip[face] ? (ATLAS_TILE - lo[ua]) : hi[ua];
+		int vLo = faceVFlip[face] ? (ATLAS_TILE - hi[va]) : lo[va];
+		int vHi = faceVFlip[face] ? (ATLAS_TILE - lo[va]) : hi[va];
+		u16 u0 = uv_raw((float)(px0 + uLo), ATLAS_TEX_W);
+		u16 u1 = uv_raw((float)(px0 + uHi), ATLAS_TEX_W);
+		u16 v0 = uv_raw((float)(py0 + vLo), ATLAS_TEX_H);
+		u16 v1 = uv_raw((float)(py0 + vHi), ATLAS_TEX_H);
+		cropped[0] = dedup_tex(fc->w, u0, v0);
+		cropped[1] = dedup_tex(fc->w, u0, v1);
+		cropped[2] = dedup_tex(fc->w, u1, v0);
+		cropped[3] = dedup_tex(fc->w, u1, v1);
+		corner = cropped;
 	}
 
-	if (!fc->emit) {                       /* count pass: build the dedup arrays */
-		dedup_clr(fc->w, sh, sh, sh, 255);
-		for (v = 0; v < 4; v++) dedup_tex(fc->w, tu[v], tv[v]);
-		fc->faceCount++;
-		return;
-	}
+	/* Count pass. It still resolves the texcoords above -- that is what keeps
+	 * every index this chunk needs in the dedup arrays before the emit pass
+	 * starts recording a display list -- but it costs a cache hit per quad now
+	 * rather than four hash probes, and no per-vertex work at all. */
+	if (!fc->emit) { fc->faceCount++; return; }
 
-	if (fc->faceIdx % BATCH_QUADS == 0) {
+	if (fc->batchLeft == 0) {
 		u32 rem = fc->faceCount - fc->faceIdx;
 		u32 n = rem < BATCH_QUADS ? rem : BATCH_QUADS;
 		GX_Begin(GX_QUADS, GX_VTXFMT0, n * 4);
+		fc->batchLeft = n;
 	}
 
-	u8 ci = dedup_clr(fc->w, sh, sh, sh, 255);
+	u8 ci = fc->clr[face];
 	s16 bx[2] = {x0, x1}, by[2] = {y0, y1}, bz[2] = {z0, z1};
 	for (v = 0; v < 4; v++) {
 		GX_Position3s16((s16)(vx * 16 + bx[faceVerts[face][v][0]]),
 		                (s16)(vy * 16 + by[faceVerts[face][v][1]]),
 		                (s16)(vz * 16 + bz[faceVerts[face][v][2]]));
 		GX_Color1x8(ci);
-		GX_TexCoord1x16(dedup_tex(fc->w, tu[v], tv[v]));
+		GX_TexCoord1x16(corner[faceUV[face][v][0] * 2 + faceUV[face][v][1]]);
 	}
 
 	fc->faceIdx++;
-	if (fc->faceIdx % BATCH_QUADS == 0) GX_End();
+	if (--fc->batchLeft == 0) GX_End();
+}
+
+/* One face of a full cube: the same quad emit_quad would produce for a 0..16
+ * box, minus everything a full cube makes constant -- the crop test, the
+ * uLo/uHi projection, the per-vertex faceUV lookup and the corner-select
+ * arrays. Cubes are the overwhelming majority of quads on every map, so this
+ * is the path worth keeping narrow; emit_quad still handles the shapes. */
+static void emit_cube_quad(FaceCtx *fc, int vx, int vy, int vz, int face,
+                           int tile) {
+	const u16 *corner = tile_corners(fc->w, tile);
+	if (!fc->emit) { fc->faceCount++; return; }
+
+	if (fc->batchLeft == 0) {
+		u32 rem = fc->faceCount - fc->faceIdx;
+		u32 n = rem < BATCH_QUADS ? rem : BATCH_QUADS;
+		GX_Begin(GX_QUADS, GX_VTXFMT0, n * 4);
+		fc->batchLeft = n;
+	}
+
+	const s16 (*cv)[3] = cubeVert[face];
+	const u8 *ck = cubeCorner[face];
+	u8 ci = fc->clr[face];
+	s16 ox = (s16)(vx * 16), oy = (s16)(vy * 16), oz = (s16)(vz * 16);
+	int v;
+	for (v = 0; v < 4; v++) {
+		GX_Position3s16((s16)(ox + cv[v][0]), (s16)(oy + cv[v][1]),
+		                (s16)(oz + cv[v][2]));
+		GX_Color1x8(ci);
+		GX_TexCoord1x16(corner[ck[v]]);
+	}
+
+	fc->faceIdx++;
+	if (--fc->batchLeft == 0) GX_End();
 }
 
 /* Emit a single free quad from 4 explicit corners (sixteenths, local to voxel
@@ -436,40 +639,33 @@ static void emit_quad(FaceCtx *fc, int vx, int vy, int vz, int face,
  * so a fixed full-bright shade is used. */
 static void emit_free_quad(FaceCtx *fc, int vx, int vy, int vz,
                            const s16 c[4][3], int tile) {
-	int col = tile % ATLAS_COLS, row = tile / ATLAS_COLS;
-	int px0 = col * ATLAS_CELL + ATLAS_PAD, py0 = row * ATLAS_CELL + ATLAS_PAD;
-	u16 u0 = uv_raw(px0, ATLAS_TEX_W), u1 = uv_raw(px0 + ATLAS_TILE, ATLAS_TEX_W);
-	u16 v0 = uv_raw(py0, ATLAS_TEX_H), v1 = uv_raw(py0 + ATLAS_TILE, ATLAS_TEX_H);
-	static const u8 cornerU[4] = {0, 1, 1, 0};  /* 0 -> u0, 1 -> u1 */
-	static const u8 cornerV[4] = {1, 1, 0, 0};  /* 0 -> v0, 1 -> v1 */
-	u16 tu[4], tv[4];
+	/* Always the whole tile, so this is a straight tile-cache lookup. The four
+	 * corners above land on tile UV (0,1),(1,1),(1,0),(0,0), which is
+	 * uBit*2 + vBit of 1, 3, 2, 0. */
+	static const u8 freeCorner[4] = {1, 3, 2, 0};
+	const u16 *corner = tile_corners(fc->w, tile);
 	int v;
-	for (v = 0; v < 4; v++) { tu[v] = cornerU[v] ? u1 : u0; tv[v] = cornerV[v] ? v1 : v0; }
 
-	if (!fc->emit) {                       /* count pass: build the dedup arrays */
-		dedup_clr(fc->w, 255, 255, 255, 255);
-		for (v = 0; v < 4; v++) dedup_tex(fc->w, tu[v], tv[v]);
-		fc->faceCount++;
-		return;
-	}
+	if (!fc->emit) { fc->faceCount++; return; }
 
-	if (fc->faceIdx % BATCH_QUADS == 0) {
+	if (fc->batchLeft == 0) {
 		u32 rem = fc->faceCount - fc->faceIdx;
 		u32 n = rem < BATCH_QUADS ? rem : BATCH_QUADS;
 		GX_Begin(GX_QUADS, GX_VTXFMT0, n * 4);
+		fc->batchLeft = n;
 	}
 
-	u8 ci = dedup_clr(fc->w, 255, 255, 255, 255);
+	u8 ci = fc->clrWhite;
 	for (v = 0; v < 4; v++) {
 		GX_Position3s16((s16)(vx * 16 + c[v][0]),
 		                (s16)(vy * 16 + c[v][1]),
 		                (s16)(vz * 16 + c[v][2]));
 		GX_Color1x8(ci);
-		GX_TexCoord1x16(dedup_tex(fc->w, tu[v], tv[v]));
+		GX_TexCoord1x16(corner[freeCorner[v]]);
 	}
 
 	fc->faceIdx++;
-	if (fc->faceIdx % BATCH_QUADS == 0) GX_End();
+	if (--fc->batchLeft == 0) GX_End();
 }
 
 typedef struct { FaceCtx *fc; int x, y, z; } ShapeSink;
@@ -558,10 +754,11 @@ static u8 pad_connect(const PadGrid *p, int lx, int ly, int lz, u8 shape) {
 	return mask;
 }
 
-/* One voxel's geometry. `lx,ly,lz` are scratch-grid local; `vx,vy,vz` are the
- * grid coords the vertices are emitted at. */
+/* One voxel's geometry. `lx,ly,lz` are scratch-grid local, `col` is its column
+ * (&p->ids[(lx*PADW+lz)*dimy], which the caller already has); `vx,vy,vz` are
+ * the grid coords the vertices are emitted at. */
 static void mesh_voxel(FaceCtx *fc, const PadGrid *p, int lx, int ly, int lz,
-                       int vx, int vy, int vz, int g) {
+                       const u16 *col, int vx, int vy, int vz, int g) {
 	u8 shape = g_blockShape[g];
 
 	if (shape != SHAPE_CUBE) {
@@ -581,18 +778,31 @@ static void mesh_voxel(FaceCtx *fc, const PadGrid *p, int lx, int ly, int lz,
 		return;
 	}
 
+	/* The six neighbours, in face order. mesh_chunk_pass only ever calls this
+	 * for the chunk's own columns (local x/z 1..WORLD_CHUNK_XZ), so a
+	 * horizontal step always lands on a real column of the padded grid -- that
+	 * is exactly what the border is for -- and needs no bounds test. Only the
+	 * vertical steps can run off the ends of the column. */
+	int cs = (int)p->dimy;          /* one column        */
+	int xs = PADW * cs;             /* one step in local x */
+	u16 nb[6];
+	nb[0] = col[ly - xs];
+	nb[1] = col[ly + xs];
+	nb[2] = (ly > 0)      ? col[ly - 1] : PAD_AIR;
+	nb[3] = (ly + 1 < cs) ? col[ly + 1] : PAD_AIR;
+	nb[4] = col[ly - cs];
+	nb[5] = col[ly + cs];
+
 	int f;
 	for (f = 0; f < 6; f++) {
 		/* Cull only against an opaque full-cube neighbour -- a non-cube one may
 		 * not cover this face, and a see-through cube (glass/leaves) would show
 		 * the culled face through its gaps, either way leaving a hole you look
 		 * through into the void. */
-		u16 nb = pad_get(p, lx + faceNormal[f][0], ly + faceNormal[f][1],
-		                 lz + faceNormal[f][2]);
-		if (nb != PAD_AIR && g_blockOpaque[nb]) continue;
+		if (nb[f] != PAD_AIR && g_blockOpaque[nb[f]]) continue;
 		/* Face order: 2:-Y(bottom) 3:+Y(top), others use the side tile. */
 		int tile = (f == 3) ? g_topTile[g] : (f == 2) ? g_bottomTile[g] : g;
-		emit_quad(fc, vx, vy, vz, f, 0, 0, 0, 16, 16, 16, tile, 0);
+		emit_cube_quad(fc, vx, vy, vz, f, tile);
 	}
 }
 
@@ -607,7 +817,7 @@ static void mesh_chunk_pass(FaceCtx *fc, const PadGrid *p) {
 			const u16 *col = &p->ids[lc * p->dimy];
 			for (ly = p->loY[lc]; ly <= p->hiY[lc]; ly++) {
 				if (col[ly] == PAD_AIR) continue;
-				mesh_voxel(fc, p, lx, ly, lz,
+				mesh_voxel(fc, p, lx, ly, lz, col,
 				           p->ox + lx, ly, p->oz + lz, col[ly]);
 			}
 		}
@@ -657,8 +867,18 @@ static void remesh_chunk(World *w, int cx, int cz, PadGrid *p, int tighten) {
 	p->oz = cz * WORLD_CHUNK_XZ - 1;
 	pad_fill(p, w);
 
+	if (tileCacheOwner != w) tile_cache_reset(w);
+
 	FaceCtx fc;
-	fc.w = w; fc.faceCount = 0; fc.faceIdx = 0; fc.emit = 0;
+	fc.w = w; fc.faceCount = 0; fc.faceIdx = 0; fc.batchLeft = 0; fc.emit = 0;
+	/* Resolved here rather than per quad, and deliberately before the display
+	 * list is opened: dedup_clr can grow clrArr, and doing that mid-recording
+	 * would put a memalign/free between two vertices. */
+	int f;
+	for (f = 0; f < 6; f++)
+		fc.clr[f] = dedup_clr(w, faceShade[f], faceShade[f], faceShade[f], 255);
+	fc.clrWhite = dedup_clr(w, 255, 255, 255, 255);
+
 	mesh_chunk_pass(&fc, p);
 
 	if (fc.faceCount == 0) {
@@ -696,9 +916,12 @@ static void remesh_chunk(World *w, int cx, int cz, PadGrid *p, int tighten) {
 
 	mesh_vtxdesc();   /* the display list is recorded against this descriptor */
 	GX_BeginDispList(w->chunkDl[ci], w->chunkDlCap[ci]);
-	fc.faceIdx = 0; fc.emit = 1;
+	fc.faceIdx = 0; fc.batchLeft = 0; fc.emit = 1;
 	mesh_chunk_pass(&fc, p);
-	if (fc.faceIdx % BATCH_QUADS != 0) GX_End();
+	/* Each batch is opened for exactly the quads that remain, so the last one
+	 * closes itself. This only fires if the two passes ever disagreed on the
+	 * count -- leaving the primitive unterminated would corrupt the list. */
+	if (fc.batchLeft != 0) GX_End();
 	w->chunkDlLen[ci] = GX_EndDispList();
 
 	/* The allocation above is an upper bound; `tighten` hands the slack back.
@@ -739,38 +962,157 @@ static void flush_vertex_arrays(const World *w) {
 	if (w->texArr) DCFlushRange(w->texArr, (w->texCount * 4 + 31) & ~31u);
 }
 
-int World_SetBlock(World *w, int bx, int by, int bz, int id) {
-	int gx, gy, gz;
-	if (!w->colStart || !w->meshPad) return 0;
+/* ---- block edits ---------------------------------------------------------
+ * Both mutation paths share everything except when the re-mesh happens:
+ * World_SetBlock does it before returning, World_SetBlockDeferred leaves it to
+ * World_FlushRemesh. */
+
+/* Chunks whose mesh an edit at grid (gx,gz) can change: the one the block lives
+ * in, plus the horizontal neighbour across a chunk seam (its culled faces and
+ * fence/wall connections read one block into this chunk). Chunks span the full
+ * Y range, so a vertical neighbour is never a different chunk. Writes chunk
+ * indices to out[0..2] and returns how many. */
+static int touched_chunks(const World *w, int gx, int gz, u32 out[3]) {
+	int cx = gx / WORLD_CHUNK_XZ, cz = gz / WORLD_CHUNK_XZ;
+	int lx = gx % WORLD_CHUNK_XZ, lz = gz % WORLD_CHUNK_XZ;
+	int n = 0;
+	out[n++] = (u32)cx * w->czCount + (u32)cz;
+	if (lx == 0 && cx > 0)
+		out[n++] = (u32)(cx - 1) * w->czCount + (u32)cz;
+	else if (lx == WORLD_CHUNK_XZ - 1 && cx + 1 < w->cxCount)
+		out[n++] = (u32)(cx + 1) * w->czCount + (u32)cz;
+	if (lz == 0 && cz > 0)
+		out[n++] = (u32)cx * w->czCount + (u32)(cz - 1);
+	else if (lz == WORLD_CHUNK_XZ - 1 && cz + 1 < w->czCount)
+		out[n++] = (u32)cx * w->czCount + (u32)(cz + 1);
+	return n;
+}
+
+/* Re-mesh one chunk by index, clear its dirty flag and fold the cost into the
+ * per-chunk accounting. The dirty flag is what makes an edit idempotent across
+ * a batch: a thousand edits inside one chunk mark it once and it is re-meshed
+ * once. */
+static void remesh_dirty(World *w, u32 ci, PadGrid *p) {
+	u64 t0 = gettime();
+	remesh_chunk(w, (int)(ci / w->czCount), (int)(ci % w->czCount), p, 0);
+	float ms = (float)ticks_to_microsecs(gettime() - t0) / 1000.0f;
+	if (ms > w->remeshChunkMsMax) w->remeshChunkMsMax = ms;
+	if (w->chunkDirty[ci]) { w->chunkDirty[ci] = 0; w->dirtyCount--; }
+}
+
+/* Record the edit in the overlay and mark the chunks it touches dirty. Returns
+ * the number of chunk indices written to `touched`, or 0 if nothing changed. */
+static int apply_edit(World *w, int bx, int by, int bz, int id, u32 touched[3]) {
+	int gx, gy, gz, n, i;
+	if (!w->colStart || !w->meshPad || !w->chunkDirty) return 0;
 	if (!to_grid(w, bx, by, bz, &gx, &gy, &gz)) return 0;
 	if (id >= 0) id = clamp_block_id(id);   /* -1 stays air */
 	if (World_GetBlock(w, bx, by, bz) == id) return 0;
 
 	if (!edit_put(w, vox_index(w, gx, gy, gz), id)) return 0;
 
-	/* Re-mesh the chunk the block lives in, plus the horizontal neighbour
-	 * across a chunk seam (its culled faces / fence connections may change).
-	 * Chunks span the full Y range, so a vertical neighbour is never in a
-	 * different chunk. */
-	int cx = gx / WORLD_CHUNK_XZ, cz = gz / WORLD_CHUNK_XZ;
-	int lx = gx % WORLD_CHUNK_XZ, lz = gz % WORLD_CHUNK_XZ;
-	int cs[3][2];
-	int n = 0;
-	cs[n][0] = cx; cs[n][1] = cz; n++;
-	if (lx == 0 && cx > 0)                        { cs[n][0] = cx - 1; cs[n][1] = cz; n++; }
-	else if (lx == WORLD_CHUNK_XZ - 1 && cx + 1 < w->cxCount) { cs[n][0] = cx + 1; cs[n][1] = cz; n++; }
-	if (lz == 0 && cz > 0)                        { cs[n][0] = cx; cs[n][1] = cz - 1; n++; }
-	else if (lz == WORLD_CHUNK_XZ - 1 && cz + 1 < w->czCount) { cs[n][0] = cx; cs[n][1] = cz + 1; n++; }
+	n = touched_chunks(w, gx, gz, touched);
+	for (i = 0; i < n; i++)
+		if (!w->chunkDirty[touched[i]]) {
+			w->chunkDirty[touched[i]] = 1;
+			w->dirtyCount++;
+		}
+	return n;
+}
+
+int World_SetBlock(World *w, int bx, int by, int bz, int id) {
+	u32 touched[3];
+	int n = apply_edit(w, bx, by, bz, id, touched);
+	if (!n) return 0;
 
 	PadGrid p;
 	pad_bind(w, &p);
 	u64 t0 = gettime();
 	int i;
-	for (i = 0; i < n; i++) remesh_chunk(w, cs[i][0], cs[i][1], &p, 0);
+	edit_merge_pending(w);   /* pad_fill reads the sorted overlay */
+	for (i = 0; i < n; i++) remesh_dirty(w, touched[i], &p);
 	flush_vertex_arrays(w);
 	w->remeshMs = (float)ticks_to_microsecs(gettime() - t0) / 1000.0f;
 	if (w->remeshMs > w->remeshMsMax) w->remeshMsMax = w->remeshMs;
 	return 1;
+}
+
+int World_SetBlockDeferred(World *w, int bx, int by, int bz, int id) {
+	u32 touched[3];
+	return apply_edit(w, bx, by, bz, id, touched) ? 1 : 0;
+}
+
+/* The most dirty chunks one flush call will re-mesh. Bounds the selection array
+ * below; a caller asking for more simply gets this many. Well past what T24's
+ * 4 ms/chunk budget leaves room for inside a 16.6 ms frame. */
+#define FLUSH_MAX 16
+
+/* ...and the wall-clock the call will spend before it stops *starting* new
+ * chunks, whatever `maxChunks` said.
+ *
+ * What a chunk costs to re-mesh is a property of the mesher, not of this queue.
+ * The per-quad work has been cut about as far as it goes without changing the
+ * mesh itself -- the whole-tile texcoord cache, the hoisted face-shade colours
+ * and the dedicated full-cube emitter took the worst chunk on mega_aegis from
+ * 24.2 ms to 8.6, and one synchronous mined block on sandbox from 18.4 to 9.4
+ * -- but the worst case is still twice this budget. What is left is structural:
+ * of that 8.6 ms the count pass is 3.5, so even deleting it outright (which
+ * means patching the GX_Begin vertex count into the recorded list after the
+ * fact, since that count is the only reason the pass exists) would land near
+ * 5 ms. Getting under 4 needs either fewer quads (merging coplanar faces) or a
+ * smaller unit of work (splitting chunks vertically, as vanilla's 16^3 sections
+ * do) -- each its own task.
+ *
+ * So `maxChunks` is a ceiling rather than a quota: a cheap map still flushes
+ * all of them in a frame, a dense one self-limits and the queue drains over a
+ * few more frames. That is what keeps a heavy map from compounding two heavy
+ * chunks into one frame -- a stale chunk for 30 ms is invisible, a dropped
+ * field is not. */
+#define FLUSH_BUDGET_US 4000.0
+
+int World_FlushRemesh(World *w, int maxChunks, double px, double pz) {
+	if (!w->chunkDirty || w->dirtyCount == 0) return 0;
+	if (!w->colStart || !w->meshPad || maxChunks <= 0) return (int)w->dirtyCount;
+	if (maxChunks > FLUSH_MAX) maxChunks = FLUSH_MAX;
+
+	/* Nearest-first: one pass over the chunk grid keeping the closest
+	 * `maxChunks` in a small insertion-sorted array. maxChunks is single
+	 * digits, so this is effectively a linear scan of a few hundred bytes --
+	 * cheaper, and far simpler, than any ordered structure that would have to
+	 * be maintained across the thousands of World_SetBlockDeferred calls
+	 * feeding it. */
+	struct { u32 ci; float d2; } pick[FLUSH_MAX];
+	int npick = 0, j;
+	u32 nchunks = (u32)w->cxCount * w->czCount, i;
+	for (i = 0; i < nchunks; i++) {
+		if (!w->chunkDirty[i]) continue;
+		/* Chunk centre in block coordinates (the grid is offset by w->min*). */
+		float dx = (float)((double)(w->minx + (int)(i / w->czCount) * WORLD_CHUNK_XZ
+		                            + WORLD_CHUNK_XZ / 2) - px);
+		float dz = (float)((double)(w->minz + (int)(i % w->czCount) * WORLD_CHUNK_XZ
+		                            + WORLD_CHUNK_XZ / 2) - pz);
+		float d2 = dx * dx + dz * dz;
+		if (npick == maxChunks && d2 >= pick[npick - 1].d2) continue;
+		j = (npick < maxChunks) ? npick++ : maxChunks - 1;
+		for (; j > 0 && pick[j - 1].d2 > d2; j--) pick[j] = pick[j - 1];
+		pick[j].ci = i; pick[j].d2 = d2;
+	}
+
+	PadGrid p;
+	pad_bind(w, &p);
+	u64 t0 = gettime();
+	edit_merge_pending(w);   /* pad_fill reads the sorted overlay */
+	for (j = 0; j < npick; j++) {
+		remesh_dirty(w, pick[j].ci, &p);
+		if ((double)ticks_to_microsecs(gettime() - t0) >= FLUSH_BUDGET_US) break;
+	}
+	/* Once per call, not per chunk: the vertex arrays are shared by every
+	 * chunk, so one flush after the whole batch is both correct and keeps a
+	 * multi-chunk flush from walking the same cache lines repeatedly. */
+	flush_vertex_arrays(w);
+	w->remeshMs = (float)ticks_to_microsecs(gettime() - t0) / 1000.0f;
+	if (w->remeshMs > w->remeshMsMax) w->remeshMsMax = w->remeshMs;
+	return (int)w->dirtyCount;
 }
 
 /* ---- wireframe box (the targeted-block outline) ---------------------------
@@ -884,6 +1226,10 @@ static void cb_store(void *ctx, int x, int y, int z, int li) {
 int World_Load(World *w, const u8 *blob, u32 blobLen) {
 	(void)blobLen;
 	memset(w, 0, sizeof(*w));
+	/* This world's texArr starts empty, so any cached tile indices are stale --
+	 * including when a caller loads over a World it never freed. */
+	tile_cache_reset(w);
+	cube_tables_init();
 
 	if (blob[0] != 'M' || blob[1] != 'W' || blob[2] != 'L' || blob[3] != '1')
 		return 0;
@@ -954,7 +1300,10 @@ int World_Load(World *w, const u8 *blob, u32 blobLen) {
 	w->chunkDlLen  = calloc(nchunks, sizeof(u32));
 	w->chunkDlCap  = calloc(nchunks, sizeof(u32));
 	w->chunkFaces  = calloc(nchunks, sizeof(u32));
-	if (!w->chunkDl || !w->chunkDlLen || !w->chunkDlCap || !w->chunkFaces) {
+	w->chunkDirty  = calloc(nchunks, 1);
+	w->dirtyCount  = 0;
+	if (!w->chunkDl || !w->chunkDlLen || !w->chunkDlCap || !w->chunkFaces ||
+	    !w->chunkDirty) {
 		World_Free(w); return 0;
 	}
 
@@ -1019,9 +1368,11 @@ void World_GetStats(const World *w, WorldStats *out) {
 	out->faces       = w->faces;
 	out->clrCount    = w->clrCount;
 	out->texCount    = w->texCount;
-	out->edits       = w->editCount;
+	out->edits       = w->editCount + w->pendCount;
+	out->dirtyChunks = w->dirtyCount;
 	out->remeshMs    = w->remeshMs;
 	out->remeshMsMax = w->remeshMsMax;
+	out->remeshChunkMsMax = w->remeshChunkMsMax;
 	if (w->chunkDlCap) {
 		u32 i;
 		for (i = 0; i < out->chunks; i++) {
@@ -1033,6 +1384,7 @@ void World_GetStats(const World *w, WorldStats *out) {
 
 void World_ResetStatsMax(World *w) {
 	w->remeshMsMax = 0.0f;
+	w->remeshChunkMsMax = 0.0f;
 }
 
 void World_DrawBlockOutline(World *w, Mtx view, int bx, int by, int bz) {
@@ -1296,8 +1648,13 @@ void World_Free(World *w) {
 	free(w->chunkDlLen);
 	free(w->chunkDlCap);
 	free(w->chunkFaces);
+	free(w->chunkDirty);
 	w->chunkDl = NULL; w->chunkDlLen = NULL;
 	w->chunkDlCap = NULL; w->chunkFaces = NULL;
+	w->chunkDirty = NULL; w->dirtyCount = 0;
+
+	/* The tile cache holds indices into texArr, which is about to go away. */
+	if (tileCacheOwner == w) tileCacheOwner = NULL;
 
 	free(w->clrArr); free(w->texArr);
 	free(w->texKey); free(w->texVal);
@@ -1312,5 +1669,5 @@ void World_Free(World *w) {
 
 	free(w->editIdx); free(w->editId);
 	w->editIdx = NULL; w->editId = NULL;
-	w->editCount = w->editCap = 0;
+	w->editCount = w->editCap = w->pendCount = 0;
 }

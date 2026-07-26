@@ -34,6 +34,7 @@
 #include "scrapyard_mworld.h"
 #include "shrooms_mworld.h"
 #include "sky_carnival_mworld.h"
+#include "spawn_mworld.h"
 #include "templar_mworld.h"
 #include "tundric_mworld.h"
 
@@ -68,6 +69,7 @@ static const MapEntry g_maps[] = {
 	{ "Scrapyard", scrapyard_mworld, scrapyard_mworld_end, 48106 },
 	{ "Shrooms", shrooms_mworld, shrooms_mworld_end, 176897 },
 	{ "Sky Carnival", sky_carnival_mworld, sky_carnival_mworld_end, 187224 },
+	{ "Spawn", spawn_mworld, spawn_mworld_end, 114774 },
 	{ "Templar", templar_mworld, templar_mworld_end, 148307 },
 	{ "Tundric", tundric_mworld, tundric_mworld_end, 186889 },
 };

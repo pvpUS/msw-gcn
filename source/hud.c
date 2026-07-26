@@ -191,6 +191,40 @@ int Hud_DrawString(const char *s, int x, int y, u32 rgba) {
 	return (int)pen;
 }
 
+/* Several strings in a single GX_Begin. One glyph quad is ~24 bytes through
+ * the immediate-mode path and a GX_Begin costs a command header and a pipeline
+ * sync either way, so a screen of nametags batched like this is one submission
+ * instead of sixteen. Text is the predictable hot spot on this target -- see
+ * the perf section of the plan -- and this is the cheapest of the mitigations.
+ *
+ * The runs must already be positioned; this only concatenates them. */
+typedef struct { const char *s; int x, y; u32 rgba; } TextRun;
+
+static void draw_runs(const TextRun *runs, int n) {
+	int total = 0, i;
+	for (i = 0; i < n; i++) total += glyph_count(runs[i].s);
+	if (total <= 0) return;
+
+	tev_tex();
+	GX_LoadTexObj(&fontTex, GX_TEXMAP0);
+	GX_Begin(GX_QUADS, HUD_FMT, (u16)(4 * total));
+	for (i = 0; i < n; i++) {
+		u32 rgb = runs[i].rgba >> 8;
+		u8  a   = (u8)(runs[i].rgba & 0xFF);
+		float pen = (float)runs[i].x;
+		const unsigned char *p = (const unsigned char *)runs[i].s;
+		for (; *p; p++) {
+			if (*p == FONT_ESC && p[1] &&
+			    format_code(p[1], runs[i].rgba, &rgb)) { p++; continue; }
+			int gi = glyph_index(*p);
+			glyph_quad(pen, (float)runs[i].y, gi,
+			           (u8)(rgb >> 16), (u8)(rgb >> 8), (u8)rgb, a);
+			pen += g_fontWidth[gi];
+		}
+	}
+	GX_End();
+}
+
 int Hud_DrawStringShadow(const char *s, int x, int y, u32 rgba) {
 	/* FontRenderer.drawString's drop shadow: the same text one pixel down-right
 	 * at a quarter brightness, alpha unchanged. */
@@ -211,6 +245,33 @@ static char *fmt_int(char *buf, int size, int v) {
 	do { *--p = (char)('0' + u % 10); u /= 10; } while (u && p > buf + 1);
 	if (neg && p > buf) *--p = '-';
 	return p;
+}
+
+/* Append `s` to buf at *pos, stopping at the end. The overlays build their
+ * lines every frame, so this stays away from stdio. */
+static void app_str(char *buf, int cap, int *pos, const char *s) {
+	while (*s && *pos < cap - 1) buf[(*pos)++] = *s++;
+	buf[*pos] = '\0';
+}
+
+static void app_int(char *buf, int cap, int *pos, int v) {
+	char tmp[12];
+	app_str(buf, cap, pos, fmt_int(tmp, sizeof tmp, v));
+}
+
+/* One decimal place, which is the useful resolution for a 16.6 ms budget. */
+static void app_ms(char *buf, int cap, int *pos, float ms) {
+	if (ms < 0.0f) ms = 0.0f;
+	int t = (int)(ms * 10.0f + 0.5f);
+	app_int(buf, cap, pos, t / 10);
+	app_str(buf, cap, pos, ".");
+	app_int(buf, cap, pos, t % 10);
+}
+
+/* Bytes as KB, the unit every budget in the plan is quoted in. */
+static void app_kb(char *buf, int cap, int *pos, u32 bytes) {
+	app_int(buf, cap, pos, (int)(bytes / 1024));
+	app_str(buf, cap, pos, "K");
 }
 
 /* Stack count over an item icon: right-aligned to rx with its baseline where
@@ -281,7 +342,7 @@ void Hud_InitGX(void) {
 	GX_InitTexObjWrapMode(&fontTex, GX_CLAMP, GX_CLAMP);
 }
 
-HudScreen Hud_Begin2D(int fbWidth, int efbHeight) {
+HudScreen Hud_Screen(int fbWidth, int efbHeight) {
 	/* GUI scale a la ScaledResolution: work in a virtual space ~1/2..1/3 the
 	 * framebuffer so HUD elements stay a sensible size across video modes. */
 	HudScreen sc;
@@ -290,6 +351,11 @@ HudScreen Hud_Begin2D(int fbWidth, int efbHeight) {
 	if (sc.scale > 3) sc.scale = 3;
 	sc.w = (float)fbWidth  / sc.scale;
 	sc.h = (float)efbHeight / sc.scale;
+	return sc;
+}
+
+HudScreen Hud_Begin2D(int fbWidth, int efbHeight) {
+	HudScreen sc = Hud_Screen(fbWidth, efbHeight);
 
 	Mtx44 proj;
 	guOrtho(proj, 0, sc.h, 0, sc.w, 0, 300);
@@ -425,6 +491,186 @@ void Hud_Draw(Player *p, int fbWidth, int efbHeight, int invOpen, int cursorSlot
 	Hud_End2D();
 }
 
+/* ---- nametags (T10) ----------------------------------------------------- */
+
+void Hud_DrawTags(const HudTag *tags, int n, int fbWidth, int efbHeight) {
+	if (n <= 0) return;
+	if (n > HUD_TAG_MAX) n = HUD_TAG_MAX;
+
+	Hud_Begin2D(fbWidth, efbHeight);
+
+	/* Plates first, in one flat pass, then every name in one textured one.
+	 * Vanilla puts the same translucent plate behind a nametag and for the
+	 * same reason: 8-pixel glyphs over a bright skywars map are otherwise
+	 * unreadable at 480p. The plate also means no drop shadow is needed,
+	 * which halves the glyph count. */
+	TextRun run[HUD_TAG_MAX];
+	int i;
+
+	tev_flat();
+	for (i = 0; i < n; i++) {
+		int w = Hud_StringWidth(tags[i].text);
+		int x = tags[i].x - w / 2;
+		int y = tags[i].y - 8;
+		rect((float)(x - 1), (float)(y - 1), (float)(w + 2), 10.0f, 0, 0, 0, 110);
+		run[i].s = tags[i].text;
+		run[i].x = x;
+		run[i].y = y;
+		run[i].rgba = tags[i].colour;
+	}
+	draw_runs(run, n);
+
+	Hud_End2D();
+}
+
+/* ---- network HUD: chat, action bar, XP (T10) ---------------------------- */
+
+void Hud_NetInit(HudNet *n) {
+	memset(n, 0, sizeof(*n));
+	n->barColour = 0xFF;
+}
+
+static void chat_push(HudNet *n, u8 colour, const char *s, int len) {
+	if (len >= HUD_CHAT_WIDTH) len = HUD_CHAT_WIDTH - 1;
+	if (len < 0) len = 0;
+	memcpy(n->line[n->head], s, len);
+	n->line[n->head][len] = '\0';
+	n->lineColour[n->head] = colour;
+	n->head = (n->head + 1) % HUD_CHAT_LINES;
+	if (n->count < HUD_CHAT_LINES) n->count++;
+	/* Only counted as unread if nobody was looking. Without this the indicator
+	 * would tick up while the log is open, which is the one time it is wrong. */
+	if (!n->show && n->unread < 999) n->unread++;
+}
+
+void Hud_NetChat(HudNet *n, u8 colour, const char *text, int len) {
+	int i = 0;
+	if (len <= 0) return;
+	/* Wrapped at a fixed character count rather than a measured width: the
+	 * ring is written when a line arrives and drawn at whatever GUI scale is
+	 * current, and HUD_CHAT_WIDTH is sized for the narrowest of them. */
+	while (i < len) {
+		int room = HUD_CHAT_WIDTH - 1;
+		int take = (len - i < room) ? (len - i) : room;
+		if (i + take < len) {
+			int b = take;
+			while (b > 1 && text[i + b] != ' ') b--;
+			if (b > room / 3) take = b;      /* break on a word if there is one */
+		}
+		chat_push(n, colour, text + i, take);
+		i += take;
+		while (i < len && text[i] == ' ') i++;
+	}
+}
+
+void Hud_NetActionBar(HudNet *n, u8 colour, const char *text, int len) {
+	if (len < 0) len = 0;
+	if (len > HUD_BAR_TEXT - 1) len = HUD_BAR_TEXT - 1;
+	memcpy(n->bar, text, len);
+	n->bar[len] = '\0';
+	n->barColour = colour;
+	n->barTicks  = len ? HUD_BAR_TICKS : 0;
+}
+
+void Hud_NetTick(HudNet *n) {
+	if (n->barTicks > 0) n->barTicks--;
+	if (n->show) n->unread = 0;
+}
+
+/* An MC colour-code index as 0xRRGGBBAA, or white for 0xFF (no code). */
+static u32 code_rgba(u8 code, u8 alpha) {
+	u32 rgb = (code > 15) ? 0xFFFFFFu : color_code(code);
+	return (rgb << 8) | alpha;
+}
+
+void Hud_DrawNetOverlay(const HudNet *n, int fbWidth, int efbHeight) {
+	HudScreen sc = Hud_Begin2D(fbWidth, efbHeight);
+	float gw = sc.w, gh = sc.h;
+
+	TextRun run[HUD_CHAT_SHOWN + 4];
+	int nr = 0;
+	char xpBuf[24], unreadBuf[24];
+
+	/* ===== pass A: the panels ===== */
+	tev_flat();
+
+	int shown = 0;
+	float chatTop = 0.0f;
+	if (n->show && n->count) {
+		shown = (n->count < HUD_CHAT_SHOWN) ? n->count : HUD_CHAT_SHOWN;
+		chatTop = gh - 46.0f - shown * 9.0f;
+		rect(1.0f, chatTop - 2.0f, gw * 0.66f, shown * 9.0f + 4.0f, 0, 0, 0, 160);
+	}
+
+	/* ===== pass B: the text, all of it in one batch ===== */
+	int i;
+	for (i = 0; i < shown; i++) {
+		/* Oldest of the visible lines first. head is one past the newest, so
+		 * the window starts `shown` entries back from it. */
+		int idx = (n->head - shown + i + HUD_CHAT_LINES) % HUD_CHAT_LINES;
+		run[nr].s = n->line[idx];
+		run[nr].x = 3;
+		run[nr].y = (int)chatTop + i * 9;
+		run[nr].rgba = code_rgba(n->lineColour[idx], 255);
+		nr++;
+	}
+
+	/* The action bar: one centred line, always on, fading out over its last
+	 * 20 ticks. This is where anything the player must not miss belongs --
+	 * the chat log is hidden, so it cannot be. */
+	if (n->barTicks > 0 && n->bar[0]) {
+		int a = (n->barTicks >= HUD_BAR_FADE)
+		      ? 255 : (n->barTicks * 255 / HUD_BAR_FADE);
+		run[nr].s = n->bar;
+		run[nr].x = (int)(gw / 2) - Hud_StringWidth(n->bar) / 2;
+		run[nr].y = (int)gh - 60;
+		run[nr].rgba = code_rgba(n->barColour, (u8)a);
+		nr++;
+	}
+
+	/* XP level is the ranked elo on this server, not experience. */
+	if (n->xpLevel > 0) {
+		int p = 0;
+		app_str(xpBuf, sizeof xpBuf, &p, "elo ");
+		app_int(xpBuf, sizeof xpBuf, &p, n->xpLevel);
+		run[nr].s = xpBuf;
+		run[nr].x = 3;
+		run[nr].y = (int)gh - 11;
+		run[nr].rgba = 0x55FF55FFu;
+		nr++;
+	}
+
+	/* Unread indicator. One glyph's worth of screen, and without it hidden
+	 * chat means silently missing every game announcement. */
+	if (!n->show && n->unread > 0) {
+		int p = 0;
+		app_str(unreadBuf, sizeof unreadBuf, &p, "\xA7" "e* ");
+		app_int(unreadBuf, sizeof unreadBuf, &p,
+		        n->unread > 99 ? 99 : n->unread);
+		app_str(unreadBuf, sizeof unreadBuf, &p, " chat");
+		run[nr].s = unreadBuf;
+		run[nr].x = 3;
+		run[nr].y = (int)gh - 21;
+		run[nr].rgba = 0xFFFFFFC0u;
+		nr++;
+	}
+
+	/* Spectator banner. The plugin cancels lethal damage and drops you into
+	 * spectator instead of killing you (T26), so this is the only signal that
+	 * anything happened -- there is no death screen to wait for. */
+	if (n->gameMode == 3) {
+		static const char *SPEC = "SPECTATING";
+		run[nr].s = SPEC;
+		run[nr].x = (int)(gw / 2) - Hud_StringWidth(SPEC) / 2;
+		run[nr].y = 12;
+		run[nr].rgba = 0xAAAAAAFFu;
+		nr++;
+	}
+
+	draw_runs(run, nr);
+	Hud_End2D();
+}
+
 /* ---- perf overlay (T27) ------------------------------------------------- */
 
 /* Exponential mean over roughly the last second at 60 Hz. A plain mean over
@@ -461,33 +707,6 @@ u32 Hud_HeapUsed(void) {
 	return (u32)mallinfo().uordblks;
 }
 
-/* Append `s` to buf at *pos, stopping at the end. The overlay builds its lines
- * every frame, so this stays away from stdio. */
-static void app_str(char *buf, int cap, int *pos, const char *s) {
-	while (*s && *pos < cap - 1) buf[(*pos)++] = *s++;
-	buf[*pos] = '\0';
-}
-
-static void app_int(char *buf, int cap, int *pos, int v) {
-	char tmp[12];
-	app_str(buf, cap, pos, fmt_int(tmp, sizeof tmp, v));
-}
-
-/* One decimal place, which is the useful resolution for a 16.6 ms budget. */
-static void app_ms(char *buf, int cap, int *pos, float ms) {
-	if (ms < 0.0f) ms = 0.0f;
-	int t = (int)(ms * 10.0f + 0.5f);
-	app_int(buf, cap, pos, t / 10);
-	app_str(buf, cap, pos, ".");
-	app_int(buf, cap, pos, t % 10);
-}
-
-/* Bytes as KB, the unit every budget in the plan is quoted in. */
-static void app_kb(char *buf, int cap, int *pos, u32 bytes) {
-	app_int(buf, cap, pos, (int)(bytes / 1024));
-	app_str(buf, cap, pos, "K");
-}
-
 void Hud_DrawPerf(const HudPerf *pf, int fbWidth, int efbHeight) {
 	HudScreen sc = Hud_Begin2D(fbWidth, efbHeight);
 
@@ -498,7 +717,7 @@ void Hud_DrawPerf(const HudPerf *pf, int fbWidth, int efbHeight) {
 
 	/* Panel behind the text: 480p is a noisy background for 8px glyphs. */
 	tev_flat();
-	rect(0, 0, 132, lh * 7 + 4, 0, 0, 0, 150);
+	rect(0, 0, 132, lh * 8 + 4, 0, 0, 0, 150);
 
 	/* Free heap first: it is the number that governs everything else. Amber
 	 * under 4 MB (the entity/network/font reserve the plan budgets for), red
@@ -540,6 +759,21 @@ void Hud_DrawPerf(const HudPerf *pf, int fbWidth, int efbHeight) {
 	app_str(line, sizeof line, &n, " max ");
 	app_ms(line, sizeof line, &n, pf->w.remeshMsMax);
 	Hud_DrawStringShadow(line, x, y, 0xFFFFFFFFu); y += lh;
+
+	/* The deferred re-mesh queue (T24): `dirty` is the meshes still owed after
+	 * this frame's World_FlushRemesh -- non-zero for the few frames after a
+	 * network block batch, and stuck non-zero means the flush is not keeping
+	 * up. `chunk` is the worst single chunk, which is the number T24's 4 ms
+	 * budget is actually stated against (the line above is a whole call, and a
+	 * call re-meshes several). */
+	n = 0;
+	app_str(line, sizeof line, &n, "dirty ");
+	app_int(line, sizeof line, &n, (int)pf->w.dirtyChunks);
+	app_str(line, sizeof line, &n, " chunk ");
+	app_ms(line, sizeof line, &n, pf->w.remeshChunkMsMax);
+	Hud_DrawStringShadow(line, x, y,
+	                     pf->w.remeshChunkMsMax > 4.0f ? 0xFFAA00FFu : 0xFFFFFFFFu);
+	y += lh;
 
 	/* Display lists: drawn / total chunks, and what they cost. `dl` is the
 	 * allocation; `use` is what was actually recorded into it, so the gap is

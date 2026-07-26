@@ -22,6 +22,11 @@
  * can ever share a culled face with an edit. */
 #define WORLD_CHUNK_XZ 16
 
+/* Block edits held unsorted before being merged into the edit overlay in one
+ * pass. See World.pendIdx and edit_put in world.c for why this exists and how
+ * the value is chosen; it is a fixed part of the World, not an allocation. */
+#define WORLD_EDIT_PEND_MAX 128
+
 typedef struct {
 	s16 minx, miny, minz;      /* grid origin in block coords (margin included)*/
 	u16 dimx, dimy, dimz;      /* grid dimensions (margin included)            */
@@ -51,12 +56,35 @@ typedef struct {
 	s16 *editId;
 	u32  editCount, editCap;
 
+	/* Edits staged but not yet merged into the sorted list above. Keeping the
+	 * list sorted costs an O(editCount) memmove per insert, which is nothing
+	 * for one mined block and ruinous for a network batch of thousands; this
+	 * makes the common case an append and pays for the ordering once per
+	 * WORLD_EDIT_PEND_MAX entries. Reads consult it ahead of the sorted list.
+	 * Always empty outside a batch -- anything that needs the sorted view
+	 * (the mesher) drains it first. */
+	u32  pendIdx[WORLD_EDIT_PEND_MAX];
+	s16  pendId [WORLD_EDIT_PEND_MAX];
+	u32  pendCount;
+
 	/* ---- render data ---------------------------------------------------- */
 	u16   cxCount, czCount;    /* chunk grid dimensions                        */
 	void **chunkDl;            /* [cxCount*czCount] display lists, NULL = empty*/
 	u32   *chunkDlLen;
 	u32   *chunkDlCap;         /* bytes allocated for each (re-mesh in place)  */
 	u32   *chunkFaces;         /* quads in each, so World.faces stays right    */
+
+	/* Chunks whose block data has changed but whose display list has not been
+	 * rebuilt yet -- one byte per chunk, plus the count so the flush can bail
+	 * in O(1) on the overwhelmingly common "nothing changed" frame. Deferring
+	 * is what lets a network block batch (hundreds of edits arriving in one
+	 * GCLink message) cost one re-mesh per chunk instead of one per block; see
+	 * World_SetBlockDeferred / World_FlushRemesh. Block *reads* are never
+	 * deferred -- the edit overlay is updated immediately, so collision and
+	 * ray-tracing are correct the instant the edit lands, and only the geometry
+	 * lags by a frame or two. */
+	u8    *chunkDirty;
+	u32    dirtyCount;
 
 	/* Indexed CLR0/TEX0 vertex arrays the display lists reference (POS is
 	 * inline). 32-byte aligned + DC-flushed; GX_SetArray'd in World_Draw.
@@ -77,7 +105,8 @@ typedef struct {
 
 	/* ---- accounting (World_GetStats) ------------------------------------ */
 	u32   chunksDrawn;         /* display lists the last World_Draw submitted */
-	float remeshMs, remeshMsMax;
+	float remeshMs, remeshMsMax;        /* per re-mesh *call*                 */
+	float remeshChunkMsMax;             /* worst single chunk, the T24 budget */
 } World;
 
 /* Local block-relative (0..1) axis-aligned box. */
@@ -118,8 +147,37 @@ int  World_InBounds(const World *w, int bx, int by, int bz);
 
 /* Set the block at (bx,by,bz) to `id` (-1 = air), recording it in the edit
  * overlay and re-meshing the affected chunk(s). Returns 1 if anything changed.
- * This is the only mutation path -- World.colStart/voxY/voxId stay as loaded. */
+ * This is the only mutation path -- World.colStart/voxY/voxId stay as loaded.
+ *
+ * Synchronous: the geometry is correct by the time this returns, which is what
+ * single-player mining and placing want (one edit at a time, and the block must
+ * visibly go away on the frame the player broke it). */
 int  World_SetBlock(World *w, int bx, int by, int bz, int id);
+
+/* ---- deferred, batched re-meshing (T24) ---------------------------------
+ * The same edit without the re-mesh: record it and mark the owning chunk (plus
+ * the neighbour across a chunk seam) dirty, leaving the display list stale
+ * until World_FlushRemesh gets to it. Same return contract as World_SetBlock.
+ *
+ * This is the path for edits that arrive in bulk -- the proxy's join-time chunk
+ * diff is hundreds of blocks in a single GCLink batch, and re-meshing inside
+ * each call would be a multi-second freeze re-recording the same few chunks
+ * over and over. */
+int  World_SetBlockDeferred(World *w, int bx, int by, int bz, int id);
+
+/* Re-mesh at most `maxChunks` dirty chunks, nearest-to-(px,pz) first (block
+ * coordinates, normally the player's). Returns the number still dirty, so a
+ * caller can tell whether the world has converged.
+ *
+ * Call once per rendered frame. Nearest-first is what makes a join look right:
+ * the chunks under and around the player resolve in the first frames, and the
+ * far side of the map catches up over the next few. Costs one early-out when
+ * nothing is dirty, which is every frame of offline play.
+ *
+ * `maxChunks` is a ceiling, not a quota -- the call also stops once it has
+ * spent its own wall-clock budget, so a dense map self-limits rather than
+ * overrunning the frame. See FLUSH_BUDGET_US in world.c. */
+int  World_FlushRemesh(World *w, int maxChunks, double px, double pz);
 
 /* Returns 1 if the block at (bx,by,bz) is a solid full cube, 0 for air/void
  * (outside the loaded region reads as air). */
@@ -176,13 +234,15 @@ typedef struct {
 	u32 dlUsed;              /* bytes actually recorded into them            */
 	u32 clrCount, texCount;  /* indexed vertex arrays, vs the 65535 ceiling  */
 	u32 edits;               /* runtime block edits in the overlay           */
-	float remeshMs, remeshMsMax;  /* last / worst re-mesh, cleared per read  */
+	u32 dirtyChunks;         /* meshes still owed after the last flush       */
+	float remeshMs, remeshMsMax;  /* last / worst re-mesh call               */
+	float remeshChunkMsMax;  /* worst single chunk (T24 budgets <= 4 ms)     */
 } WorldStats;
 
 void World_GetStats(const World *w, WorldStats *out);
 
-/* Reset the rolling maxima (remeshMsMax), so a spike can be attributed to
- * what just happened rather than to the whole session. */
+/* Reset the rolling maxima (remeshMsMax, remeshChunkMsMax), so a spike can be
+ * attributed to what just happened rather than to the whole session. */
 void World_ResetStatsMax(World *w);
 
 void World_Free(World *w);

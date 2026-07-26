@@ -1,0 +1,18 @@
+{
+  "name": "msw-gcn-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Speaks Minecraft 1.8.9 to the MegaSkywars server and GCLink to a GameCube.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "stub": "node stub.js",
+    "test": "node selftest.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "minecraft-protocol": "^1.47.0"
+  }
+}

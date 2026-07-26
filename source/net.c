@@ -19,6 +19,14 @@
 #define RX_CAP (GCLINK_MAX_PAYLOAD + GCLINK_HEADER * 2)
 #define TX_CAP 4096
 
+/* How much a single drain may pull off the socket. One TCP receive window is
+ * not enough: lwIP's is a couple of kilobytes, and a game with sixteen players
+ * in it streams entity updates at tens of KB/s, so a drain that reads once and
+ * stops falls further behind every frame until the keepalive it is starving
+ * declares the link dead. This is ~40x the real rate -- generous enough never
+ * to be the limit, bounded so a flooded socket cannot hold a frame open. */
+#define RX_PER_DRAIN (64 * 1024)
+
 /* Give the proxy this long to answer HELLO before assuming it is not one. */
 #define HANDSHAKE_TIMEOUT_MS 5000
 /* Wait this long after a drop before dialling again, so a proxy that is down
@@ -36,21 +44,23 @@ static struct {
 	char     lastError[64];
 
 	u8       rx[RX_CAP];
-	u32      rxLen;                  /* bytes held                       */
-	u32      rxTake;                 /* consumed by the current drain     */
+	u32      rxHead;                 /* first byte not yet handed out    */
+	u32      rxLen;                  /* bytes held from rxHead           */
+	u32      rxBudget;               /* bytes this drain may still read  */
 
 	u8       tx[TX_CAP];
 	u32      txHead, txTail;         /* ring, txHead == txTail is empty  */
 
 	u64      stateSince;             /* gettime() when `state` was entered */
 	u64      lastPing;               /* gettime() of the last GC_S_PING    */
+	u64      lastData;               /* gettime() of the last byte received*/
 	u64      retryAt;                /* gettime() to redial at, 0 = never  */
 	u16      rttMs;
 	u32      bytesIn, bytesOut;
 /* Designated so the one field that is not zero at rest stays correct however
  * the struct is reordered later; 0 is a legal socket descriptor, so "closed"
  * has to be -1 rather than the zero the rest gets by being static. */
-} N = { .sock = -1, .state = NET_DOWN };
+} N = { .sock = -1, .state = NET_DOWN, .rxBudget = RX_PER_DRAIN };
 
 /* ---- small helpers ------------------------------------------------------ */
 
@@ -101,9 +111,11 @@ static int sock_ready(int forWrite) {
 static void close_socket(void) {
 	if (N.sock >= 0) net_close(N.sock);
 	N.sock = -1;
-	N.rxLen = N.rxTake = 0;
+	N.rxHead = N.rxLen = 0;
+	N.rxBudget = RX_PER_DRAIN;
 	N.txHead = N.txTail = 0;
 	N.lastPing = 0;
+	N.lastData = 0;
 	N.rttMs = 0;
 }
 
@@ -264,26 +276,47 @@ static void pump_connecting(void) {
 
 /* ---- inbound ------------------------------------------------------------ */
 
-/* Drop what the last drain consumed and slide the remainder down. Frames are
- * handed out as pointers into rx[], so this can only run between drains --
- * which is exactly what Net_Poll's contract ("valid until the next call")
- * buys. */
-static void rx_compact(void) {
-	if (!N.rxTake) return;
-	N.rxLen -= N.rxTake;
-	if (N.rxLen) memmove(N.rx, N.rx + N.rxTake, N.rxLen);
-	N.rxTake = 0;
+/* Slide the unconsumed remainder back to the front, but only when the tail has
+ * actually run out of room.
+ *
+ * Consuming a message just advances rxHead, so a drain that hands out two
+ * hundred small frames costs two hundred pointer bumps rather than two hundred
+ * memmoves of the whole buffer -- which, at the rate a busy game streams
+ * entity updates, is the difference between amortised O(1) and O(n^2) in the
+ * hot path. The move that does happen is what makes the "valid until the next
+ * Net_Poll" contract exactly true: a returned pointer stays good until the
+ * next call, and no longer. */
+static void rx_make_room(void) {
+	if (N.rxHead == 0) return;
+	if (N.rxHead + N.rxLen < RX_CAP) return;
+	if (N.rxLen) memmove(N.rx, N.rx + N.rxHead, N.rxLen);
+	N.rxHead = 0;
 }
 
-static void rx_fill(void) {
-	while (N.sock >= 0 && N.rxLen < RX_CAP && sock_ready(0)) {
-		s32 got = net_recv(N.sock, N.rx + N.rxLen, (s32)(RX_CAP - N.rxLen), 0);
-		if (got > 0) { N.rxLen += (u32)got; N.bytesIn += (u32)got; continue; }
-		if (got == 0) { Net_Disconnect("proxy closed the link"); return; }
-		if (would_block(got)) return;
+/* Read whatever the socket has, up to this drain's budget. Returns the bytes
+ * taken in, so the caller can tell "nothing left" from "more to come". */
+static u32 rx_fill(void) {
+	u32 total = 0;
+	while (N.sock >= 0 && N.rxBudget && sock_ready(0)) {
+		rx_make_room();
+		u32 room = RX_CAP - N.rxHead - N.rxLen;
+		if (room > N.rxBudget) room = N.rxBudget;
+		if (!room) break;
+		s32 got = net_recv(N.sock, N.rx + N.rxHead + N.rxLen, (s32)room, 0);
+		if (got > 0) {
+			N.rxLen += (u32)got;
+			N.bytesIn += (u32)got;
+			N.rxBudget -= (u32)got;
+			N.lastData = gettime();
+			total += (u32)got;
+			continue;
+		}
+		if (got == 0) { Net_Disconnect("proxy closed the link"); break; }
+		if (would_block(got)) break;
 		Net_Disconnect("recv failed");
-		return;
+		break;
 	}
+	return total;
 }
 
 /* HELLO / DISCONNECT / PING are the link's own business and never reach the
@@ -333,54 +366,71 @@ static int handle_internal(const NetMsg *m) {
 }
 
 int Net_Poll(NetMsg *out) {
-	/* First call of a frame: retire the previous frame's messages, take in
-	 * whatever arrived, and run the connect/keepalive machine. Subsequent
-	 * calls just keep handing out what is already buffered. */
-	if (N.rxTake == 0) {
-		if (N.state == NET_IDLE && N.retryAt && gettime() >= N.retryAt) dial();
-		if (N.state == NET_CONNECTING) pump_connecting();
-		tx_flush();
-		rx_fill();
-		if (N.state == NET_HANDSHAKE &&
-		    ms_since(N.stateSince) > HANDSHAKE_TIMEOUT_MS) {
-			Net_Disconnect("no HELLO from the proxy");
-		}
-		/* TCP will not notice a proxy that has stopped talking but not closed
-		 * -- a wedged process, a pulled cable on its side. The PING clock
-		 * will. */
-		if (N.state == NET_READY && ms_since(N.lastPing) > GCLINK_PING_TIMEOUT_MS) {
-			Net_Disconnect("proxy stopped responding");
-		}
-	} else {
-		rx_compact();
+	/* Housekeeping on every call, not once per frame. It is a handful of
+	 * compares plus a send that early-outs on an empty queue, and keying it to
+	 * "the first call of a frame" meant a caller that stops draining early --
+	 * T11 does, on a map change -- skipped the connect and keepalive machine
+	 * for a whole frame. */
+	if (N.state == NET_IDLE && N.retryAt && gettime() >= N.retryAt) dial();
+	if (N.state == NET_CONNECTING) pump_connecting();
+	tx_flush();
+	if (N.state == NET_HANDSHAKE &&
+	    ms_since(N.stateSince) > HANDSHAKE_TIMEOUT_MS) {
+		Net_Disconnect("no HELLO from the proxy");
+	}
+	/* TCP will not notice a proxy that has stopped talking but not closed --
+	 * a wedged process, a pulled cable on its side. The PING clock will.
+	 *
+	 * But bytes arriving are proof of life too, and they have to count. The
+	 * Broadband Adapter's lwIP has a small receive window and delayed ACKs,
+	 * which puts its practical ceiling around ten to fifteen KB/s; past that
+	 * the proxy's send queue backs up and a PING can sit behind a second or
+	 * more of entity updates. Keying liveness on the PING alone meant a busy
+	 * game -- the exact case this link exists for -- tore its own session down
+	 * every eight seconds while data was streaming in the whole time. Latency
+	 * under a burst is a cost; dropping the link over it is a bug. */
+	if (N.state == NET_READY &&
+	    ms_since(N.lastPing) > GCLINK_PING_TIMEOUT_MS &&
+	    ms_since(N.lastData) > GCLINK_PING_TIMEOUT_MS) {
+		Net_Disconnect("proxy stopped responding");
 	}
 
-	while (N.rxLen >= GCLINK_HEADER) {
-		u16 flen = gc_get_u16(N.rx);           /* type + payload */
-		if (flen < 1 || flen > GCLINK_MAX_PAYLOAD + 1) {
-			Net_Disconnect("bad frame length");
-			return 0;
-		}
-		u32 total = GCLINK_HEADER + (u32)flen - 1;
-		if (N.rxLen < total) break;            /* the rest is still in flight */
+	for (;;) {
+		while (N.rxLen >= GCLINK_HEADER) {
+			const u8 *p = N.rx + N.rxHead;
+			u16 flen = gc_get_u16(p);          /* type + payload */
+			if (flen < 1 || flen > GCLINK_MAX_PAYLOAD + 1) {
+				Net_Disconnect("bad frame length");
+				N.rxBudget = RX_PER_DRAIN;
+				return 0;
+			}
+			u32 total = GCLINK_HEADER + (u32)flen - 1;
+			if (N.rxLen < total) break;        /* the rest is still in flight */
 
-		NetMsg m;
-		m.type = N.rx[2];
-		m.len  = (u16)(flen - 1);
-		m.data = m.len ? N.rx + GCLINK_HEADER : NULL;
-		N.rxTake = total;
+			NetMsg m;
+			m.type = p[2];
+			m.len  = (u16)(flen - 1);
+			m.data = m.len ? p + GCLINK_HEADER : NULL;
+			N.rxHead += total;
+			N.rxLen  -= total;
 
-		if (!handle_internal(&m)) {
-			if (out) *out = m;
-			return 1;
+			if (!handle_internal(&m)) {
+				if (out) *out = m;
+				return 1;
+			}
+			/* Consumed internally: look at the next one. A disconnect inside
+			 * the handler resets the buffer, so re-check. */
+			if (N.sock < 0) { N.rxBudget = RX_PER_DRAIN; return 0; }
 		}
-		/* Consumed internally: retire it and look at the next one. Disconnect
-		 * inside the handler resets the buffer, so re-check. */
-		if (N.sock < 0) { N.rxTake = 0; return 0; }
-		rx_compact();
+
+		/* Nothing complete left. Top the buffer up and look again rather than
+		 * waiting for the next frame -- see RX_PER_DRAIN. */
+		if (!rx_fill()) break;
 	}
 
-	N.rxTake = 0;
+	/* The drain finished, so this is the end of a frame's worth of reading;
+	 * give the next one its full budget back. */
+	N.rxBudget = RX_PER_DRAIN;
 	return 0;
 }
 
