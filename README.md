@@ -45,15 +45,38 @@ glass) are synthesised by tinting a neutral base.
 
 ## Regenerating the embedded data
 
-The compressed maps (`data/*.mworld`), the atlas (`data/atlas.tpl`) and the map
-table (`source/maps_gen.h`) are generated from the block scans and resource pack.
-Requires Python 3 with Pillow, plus `gxtexconv` from devkitPro:
+The compressed maps (`data/*.mworld`), the atlas (`data/atlas.tpl`), the glyph
+sheet (`data/font.tpl`) and the map table (`source/maps_gen.h`) are generated
+from the block scans, the resource pack and MCP-919's assets. The block palette
+(`data/blockids.txt`) is vendored in the repo, so only the map scans themselves
+live outside it. Requires Python 3 with Pillow, plus `gxtexconv` from devkitPro:
 
 ```sh
 python tools/compress_worlds.py <BlockScans dir> data
-python tools/build_atlas.py     <BlockScans>/_blockids.txt data
-gxtexconv -i data/atlas.png -o data/atlas.tpl colfmt=6 && rm data/atlas.png
+python tools/build_atlas.py                       # reads data/blockids.txt
+python tools/gen_block_props.py
+python tools/gen_blockmap.py                      # proxy/blockmap.json + the HELLO hash
+python tools/build_font.py
+
+cd data
+gxtexconv -i atlas.png -o atlas.tpl colfmt=5 mipmap=yes minlod=0 maxlod=2
+gxtexconv -i font.png  -o font.tpl  colfmt=0 mipmap=no
+rm atlas.png atlas.h font.png font.h
 ```
+
+`colfmt=5` is **RGB5A3** — 16-bit colour with 3-bit alpha, half the size of the
+RGBA8 the atlas used to be baked at (2.6 MB against 5.25 MB, all of it
+`.rodata` in the DOL and therefore all of it heap you don't get). The world
+shader only alpha-*tests*, so 3 bits of alpha is exactly enough, and 16×16
+pixel art has too few distinct colours per tile for the 5-bit channels to show.
+`colfmt=14` (CMPR, ~0.7 MB) is the emergency lever if more is ever needed, at
+the cost of visible DXT1 blocking on pixel art.
+
+`colfmt=0` is **I4** for the font: GX expands an I4 texel to (I,I,I,I), so one
+4-bit channel is both the glyph and its cutout.
+
+`mipmap=yes` silently emits a truncated TPL if the source PNG is not
+power-of-two — check the output size before trusting it.
 
 ## Building
 

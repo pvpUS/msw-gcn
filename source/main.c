@@ -1,4 +1,4 @@
-﻿/*---------------------------------------------------------------------------------
+/*---------------------------------------------------------------------------------
 
 	msw-gcn - Mega Skywars for the GameCube
 
@@ -7,12 +7,14 @@
 	textures pulled from the RKYfault resource pack atlas.
 
 ---------------------------------------------------------------------------------*/
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <malloc.h>
 #include <gccore.h>
 #include <ogc/lwp_watchdog.h>
+#include <ogc/console.h>
 
 #include "camera.h"
 #include "player.h"
@@ -126,6 +128,60 @@ static void FillDemoItems(Player *player) {
  * BBA plan is read off it, and on a 24 MB machine an unmeasured budget is an
  * aspiration. */
 #define PERF_HUD 1
+
+/* Boot-time map audit: load and free every embedded map in turn and report,
+ * on the libogc console, what each one costs and whether it gave the memory
+ * back. Set to 1, build, boot, screenshot -- the whole regression check for
+ * "all the maps still load" in one run with no controller input, which is how
+ * anything that changes the palette, the mesh format or the atlas gets
+ * cleared. Leave at 0 for normal play. */
+#define MAP_AUDIT_MODE 0
+
+#if MAP_AUDIT_MODE
+static void MapAudit(void) {
+	console_init(xfb[0], 0, 0, rmode->fbWidth, rmode->xfbHeight,
+	             rmode->fbWidth * 2);
+	VIDEO_SetNextFramebuffer(xfb[0]);
+	VIDEO_Flush();
+
+	printf("\x1b[2J\x1b[1;1H  MAP AUDIT  -  %d maps, free heap %uK at boot\n",
+	       MAP_COUNT, Hud_HeapFree() / 1024);
+	printf("  peak = heap the loaded world holds; leak = not returned on free\n\n");
+
+	u32 worst = 0, leaked = 0;
+	const char *worstName = "-";
+	int failed = 0, i;
+
+	for (i = 0; i < MAP_COUNT; i++) {
+		World w;
+		u32 before = Hud_HeapUsed();
+		u32 size = (u32)(g_maps[i].end - g_maps[i].data);
+		int ok = World_Load(&w, g_maps[i].data, size);
+		u32 peak = ok ? Hud_HeapUsed() - before : 0;
+		if (ok) World_Free(&w);
+		u32 after = Hud_HeapUsed();
+
+		if (!ok) failed++;
+		if (peak > worst) { worst = peak; worstName = g_maps[i].name; }
+		if (after > before) leaked += after - before;
+
+		/* Two per row, so 32 maps fit a 480p console without scrolling. */
+		printf("  %-14.14s %s%5uK%s", g_maps[i].name,
+		       ok ? "" : "FAIL ", peak / 1024,
+		       (after > before) ? "*" : " ");
+		if (i % 2) printf("\n");
+	}
+	if (MAP_COUNT % 2) printf("\n");
+
+	printf("\n  worst: %s at %uK    free heap now %uK\n",
+	       worstName, worst / 1024, Hud_HeapFree() / 1024);
+	printf("  %d/%d loaded, %uK not returned on free%s\n",
+	       MAP_COUNT - failed, MAP_COUNT, leaked / 1024,
+	       leaked ? "  (* marks the maps)" : "");
+
+	while (1) VIDEO_WaitVSync();
+}
+#endif
 
 static u32 CountEntities(const ItemWorld *iw) {
 	u32 n = 0;
@@ -376,6 +432,10 @@ int main(int argc, char **argv) {
 	Hud_InitGX();
 	HeldItem_InitGX();
 
+#if MAP_AUDIT_MODE
+	MapAudit();   /* never returns */
+#endif
+
 	/* Set to a map index to bypass the menu (rendering smoke test); -1 = menu. */
 #define TEST_AUTOLOAD (-1)
 	while (1) {
@@ -392,7 +452,14 @@ int main(int argc, char **argv) {
 		}
 		if (sel < 0) break; /* gallery map missing from this build */
 #elif TEST_AUTOLOAD >= 0
-		int sel = TEST_AUTOLOAD;
+		/* Read through a volatile so g_maps[] stays live. With a constant index
+		 * GCC folds the array access, every other map blob becomes unreferenced,
+		 * and --gc-sections (on by default in gamecube_rules, together with
+		 * -fdata-sections) drops all 31 of them -- a DOL 4.4 MB smaller than the
+		 * shipping one, and a heap reading to match. An autoload build has to
+		 * measure like the real thing or the perf overlay lies. */
+		static volatile int autoloadIndex = TEST_AUTOLOAD;
+		int sel = autoloadIndex;
 #else
 		int sel = Menu_Run(g_maps, MAP_COUNT, xfb[0], rmode);
 		if (sel < 0) break;

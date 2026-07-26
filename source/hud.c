@@ -1,5 +1,6 @@
 #include <math.h>
 #include <string.h>
+#include <malloc.h>     /* mallinfo, for the heap-used reading */
 #include <gccore.h>
 #include <ogc/tpl.h>
 
@@ -432,8 +433,8 @@ void Hud_Draw(Player *p, int fbWidth, int efbHeight, int invOpen, int cursorSlot
 
 void Hud_PerfInit(HudPerf *pf) {
 	memset(pf, 0, sizeof(*pf));
-	pf->heapFree = (u32)((char *)SYS_GetArena1Hi() - (char *)SYS_GetArena1Lo());
-	pf->heapLow  = pf->heapFree;
+	pf->heapFree = Hud_HeapFree();
+	pf->heapUsed = pf->heapUsedMax = Hud_HeapUsed();
 }
 
 void Hud_PerfSample(HudPerf *pf, double frameUs, double tickUs,
@@ -444,10 +445,19 @@ void Hud_PerfSample(HudPerf *pf, double frameUs, double tickUs,
 	if (pf->frameMs > pf->frameMsMax) pf->frameMsMax = pf->frameMs;
 	if (pf->tickMs  > pf->tickMsMax)  pf->tickMsMax  = pf->tickMs;
 
-	pf->heapFree = (u32)((char *)SYS_GetArena1Hi() - (char *)SYS_GetArena1Lo());
-	if (pf->heapFree < pf->heapLow) pf->heapLow = pf->heapFree;
+	pf->heapFree = Hud_HeapFree();
+	pf->heapUsed = Hud_HeapUsed();
+	if (pf->heapUsed > pf->heapUsedMax) pf->heapUsedMax = pf->heapUsed;
 	pf->entities = entities;
 	if (w) World_GetStats(w, &pf->w);
+}
+
+u32 Hud_HeapFree(void) {
+	return (u32)((char *)SYS_GetArena1Hi() - (char *)SYS_GetArena1Lo());
+}
+
+u32 Hud_HeapUsed(void) {
+	return (u32)mallinfo().uordblks;
 }
 
 /* Append `s` to buf at *pos, stopping at the end. The overlay builds its lines
@@ -496,10 +506,12 @@ void Hud_DrawPerf(const HudPerf *pf, int fbWidth, int efbHeight) {
 	u32 heapColor = kbFree < 2048 ? 0xFF5555FFu
 	              : kbFree < 4096 ? 0xFFAA00FFu : 0x55FF55FFu;
 	n = 0;
-	app_str(line, sizeof line, &n, "heap ");
+	app_str(line, sizeof line, &n, "free ");
 	app_kb(line, sizeof line, &n, pf->heapFree);
-	app_str(line, sizeof line, &n, " low ");
-	app_kb(line, sizeof line, &n, pf->heapLow);
+	app_str(line, sizeof line, &n, " used ");
+	app_kb(line, sizeof line, &n, pf->heapUsed);
+	app_str(line, sizeof line, &n, " pk ");
+	app_kb(line, sizeof line, &n, pf->heapUsedMax);
 	Hud_DrawStringShadow(line, x, y, heapColor); y += lh;
 
 	/* A vsync-locked frame is 16.67 ms, so that is the healthy reading, not the

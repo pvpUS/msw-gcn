@@ -76,8 +76,14 @@ int Hud_StringWidth(const char *s);
 typedef struct {
 	float frameMs, frameMsAvg, frameMsMax;  /* wall time for a whole frame  */
 	float tickMs,  tickMsMax;               /* the 20 Hz sim inside it      */
-	u32   heapFree;      /* SYS_GetArena1Hi - Lo, bytes                     */
-	u32   heapLow;       /* the least free it has ever been                 */
+	/* Two different questions, and both matter:
+	 *   heapFree = SYS_GetArena1Hi - Lo, the arena malloc has never had to
+	 *     touch. sbrk never gives ground back, so this only ever falls -- it
+	 *     is the headroom left for everything still to be built.
+	 *   heapUsed = mallinfo().uordblks, what is allocated right now. This is
+	 *     the number the plan's per-map budgets are stated against, and the
+	 *     one that comes back down when a world is freed. */
+	u32   heapFree, heapUsed, heapUsedMax;
 	u32   entities;      /* live entities (item drops today; T9 grows this) */
 	WorldStats w;        /* World_GetStats                                  */
 } HudPerf;
@@ -93,6 +99,11 @@ void Hud_PerfSample(HudPerf *pf, double frameUs, double tickUs,
 
 /* Draw the overlay top-left, in its own 2D pass. */
 void Hud_DrawPerf(const HudPerf *pf, int fbWidth, int efbHeight);
+
+/* The two heap numbers on their own, for callers that measure outside a frame
+ * (the boot-time map audit). See HudPerf for what each one means. */
+u32 Hud_HeapFree(void);
+u32 Hud_HeapUsed(void);
 
 /* Draw the HUD for `p`. fbWidth/efbHeight are the current EFB dimensions (the
  * same values passed to GX_SetViewport). `invOpen` shows the full inventory

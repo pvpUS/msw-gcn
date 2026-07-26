@@ -651,7 +651,7 @@ static void pad_bind(const World *w, PadGrid *p) {
 
 /* Record chunk (cx,cz)'s display list from the current block data, replacing
  * whatever was there. */
-static void remesh_chunk(World *w, int cx, int cz, PadGrid *p) {
+static void remesh_chunk(World *w, int cx, int cz, PadGrid *p, int tighten) {
 	u32 ci = (u32)cx * w->czCount + (u32)cz;
 	p->ox = cx * WORLD_CHUNK_XZ - 1;
 	p->oz = cz * WORLD_CHUNK_XZ - 1;
@@ -700,6 +700,37 @@ static void remesh_chunk(World *w, int cx, int cz, PadGrid *p) {
 	mesh_chunk_pass(&fc, p);
 	if (fc.faceIdx % BATCH_QUADS != 0) GX_End();
 	w->chunkDlLen[ci] = GX_EndDispList();
+
+	/* The allocation above is an upper bound; `tighten` hands the slack back.
+	 *
+	 * The bound turns out to be nearly tight -- 36 B/quad is exactly what gets
+	 * recorded -- so what this recovers is the fixed per-chunk overhead (the
+	 * GX_Begin headers, the descriptor flush and the 512-byte cushion), a few
+	 * hundred bytes each. Worth taking across a 400-chunk map, not the
+	 * megabyte the display lists' size might suggest.
+	 *
+	 * Only at load, where all the chunks are allocated in one pass and the
+	 * copy is amortised over meshing the whole map. An incremental re-mesh
+	 * would otherwise churn a full-size allocation plus a copy every time a
+	 * block changes, for those same few hundred bytes -- and T24 is about to
+	 * make block changes arrive hundreds at a time.
+	 *
+	 * Keeps the existing buffer if the smaller one can't be allocated: this
+	 * runs with the heap at its fullest, and a failure here must not cost a
+	 * chunk its geometry. */
+	if (tighten) {
+		u32 tight = (w->chunkDlLen[ci] + 31) & ~31u;
+		if (tight + 32 <= w->chunkDlCap[ci]) {
+			void *sb = memalign(32, tight);
+			if (sb) {
+				memcpy(sb, w->chunkDl[ci], w->chunkDlLen[ci]);
+				DCFlushRange(sb, tight);
+				free(w->chunkDl[ci]);
+				w->chunkDl[ci] = sb;
+				w->chunkDlCap[ci] = tight;
+			}
+		}
+	}
 }
 
 /* The GX arrays the chunk lists index into must be visible to the GP. */
@@ -735,7 +766,7 @@ int World_SetBlock(World *w, int bx, int by, int bz, int id) {
 	pad_bind(w, &p);
 	u64 t0 = gettime();
 	int i;
-	for (i = 0; i < n; i++) remesh_chunk(w, cs[i][0], cs[i][1], &p);
+	for (i = 0; i < n; i++) remesh_chunk(w, cs[i][0], cs[i][1], &p, 0);
 	flush_vertex_arrays(w);
 	w->remeshMs = (float)ticks_to_microsecs(gettime() - t0) / 1000.0f;
 	if (w->remeshMs > w->remeshMsMax) w->remeshMsMax = w->remeshMs;
@@ -937,7 +968,7 @@ int World_Load(World *w, const u8 *blob, u32 blobLen) {
 	int cx, cz;
 	for (cx = 0; cx < w->cxCount; cx++)
 		for (cz = 0; cz < w->czCount; cz++)
-			remesh_chunk(w, cx, cz, &p);
+			remesh_chunk(w, cx, cz, &p, 1);
 	flush_vertex_arrays(w);
 	return 1;
 }
