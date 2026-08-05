@@ -19,6 +19,7 @@
 #include "camera.h"
 #include "player.h"
 #include "input.h"
+#include "pad.h"
 #include "world.h"
 #include "hud.h"
 #include "helditem.h"
@@ -26,6 +27,7 @@
 #include "interact.h"
 #include "combat.h"
 #include "cmdmenu.h"
+#include "settings.h"
 #include "items.h"        /* Block_IsLiquid, for the fluid self-test */
 #include "net.h"
 #include "netgame.h"
@@ -50,8 +52,37 @@ static void *xfb[2] = {NULL, NULL};
 static GXRModeObj *rmode;
 
 /* Perspective projection, reloaded before each World_Draw because the HUD pass
- * swaps in an orthographic matrix. */
-static Mtx44 g_proj;
+ * swaps in an orthographic matrix.
+ *
+ * Two of them, because the FOV setting must not move the held item: g_proj
+ * follows g_settings.fovDeg and g_projHand is pinned at SETTINGS_FOV_DEF. That
+ * is the split vanilla makes too -- ItemRenderer's hand is drawn with
+ * getFOVModifier(useFOVSetting = false) -- and it exists because helditem.c's
+ * placement offsets are tuned against one frustum, not because the maths would
+ * fail in another. */
+static Mtx44 g_proj, g_projHand;
+static u16   g_projFov;   /* the FOV g_proj was last built for */
+
+/* Rebuild g_proj if the setting moved. Cheap enough to call every frame and
+ * pointless to call more often than the setting changes, so it does both.
+ *
+ * The clamp is not tidiness, it is what makes the early-out safe. `g_projFov`
+ * starts at 0, so if `fovDeg` could also be 0 -- an uninitialised struct, a
+ * caller that reads settings before Settings_Defaults -- the two would match on
+ * the very first call, guPerspective would never run, and g_proj would stay all
+ * zeroes. Every vertex in the world then collapses and the screen is nothing but
+ * the clear colour, while the HUD's own orthographic matrix carries on drawing
+ * perfectly. Clamping to a legal FOV means 0 can never be the current value, so
+ * the first call always builds. A bad setting must not be able to blank the
+ * screen. */
+static void UpdateProjection(void) {
+	u16 fov = g_settings.fovDeg;
+	if (fov < SETTINGS_FOV_MIN || fov > SETTINGS_FOV_MAX) fov = SETTINGS_FOV_DEF;
+	if (g_projFov == fov) return;
+	g_projFov = fov;
+	guPerspective(g_proj, (f32)fov,
+	              (f32)rmode->viWidth / (f32)rmode->viHeight, 1.0f, 8000.0f);
+}
 
 /* Physics runs at a fixed 20 Hz (one Minecraft tick = 50 ms) regardless of
  * the 50/60 Hz video field rate; positions are interpolated for rendering. */
@@ -194,7 +225,7 @@ static void FillDemoItems(Player *player) {
  * NET_PROXY_IP is the machine running proxy/stub.js. A #define for now; T11
  * gives it a menu entry. */
 #define NET_TEST_MODE 0
-#define NET_PROXY_IP  "192.168.4.40"
+#define NET_PROXY_IP  "192.168.4.62"
 
 /* Boot straight into network mode instead of the menu (T11). Dolphin cannot
  * be driven by injected controller input in this setup -- see the project's
@@ -202,6 +233,82 @@ static void FillDemoItems(Player *player) {
  * keypress is to compile the keypress away, the same trick TEST_AUTOLOAD uses
  * for the map list. Leave at 0 for normal play. */
 #define NET_AUTOLOAD 0
+
+/* Boot trace for network mode.
+ *
+ * NetBringUp leaves the libogc console up, and RunNetwork does not overwrite it
+ * until the first frame's GX_CopyDisp -- so a console that wedges inside frame 1
+ * leaves "dialling ..." on screen and says nothing else, which is exactly what a
+ * console that is fine but has nothing to draw looks like. With this on, the
+ * first NET_TRACE_FRAMES frames print a breadcrumb per stage and are copied to
+ * xfb[1] without being shown, so the text survives: whatever the last line on
+ * screen is, that is the call that did not come back. 0 for normal play. */
+#define NET_TRACE_FRAMES 0
+
+#if NET_TRACE_FRAMES
+static int g_traceFrame;
+#define TRACE_HOLD()  (g_traceFrame < NET_TRACE_FRAMES)
+#define TRACE(...)    do { if (TRACE_HOLD()) { printf("  "); printf(__VA_ARGS__); \
+                                               printf("\n"); } } while (0)
+
+/* GX_DrawDone with a deadline, and the GP's own status when it expires.
+ *
+ * GX_DrawDone sleeps until the GP raises the DrawDone interrupt, so a GP that
+ * never reaches the token takes the whole console with it -- and from the
+ * outside that is indistinguishable from a game that simply has nothing to
+ * draw. Polling GX_GetGPStatus instead separates the two failures that hide
+ * behind that hang: readIdle/cmdIdle set means the GP finished the frame and
+ * the *interrupt* was lost, and readIdle clear means the GP is genuinely
+ * stalled part-way through the command stream. Returning either way keeps the
+ * frame loop -- and with it the link's keepalive -- running, so the proxy log
+ * says whether everything else is healthy behind the stall. */
+#define TRACE_GP_FRAMES 8
+static volatile int g_gpDone;
+static void trace_done_cb(void) { g_gpDone = 1; }
+
+static void trace_drawdone(void) {
+	u8 overhi = 0, underlow = 0, readIdle = 0, cmdIdle = 0, brkpt = 0;
+	u64 t0;
+	u32 ms;
+
+	/* The DrawDone token itself, not the CP's idle bits: those are the command
+	 * processor's view and never read idle here even on a frame that finished,
+	 * so polling them called every frame a stall. This waits on the same signal
+	 * GX_DrawDone does and only gives up on a deadline. */
+	g_gpDone = 0;
+	GX_SetDrawDone();
+	t0 = gettime();
+	for (;;) {
+		ms = (u32)ticks_to_millisecs(gettime() - t0);
+		if (g_gpDone) break;
+		if (ms > 500) break;
+	}
+	if (g_traceFrame < TRACE_GP_FRAMES) {
+		GX_GetGPStatus(&overhi, &underlow, &readIdle, &cmdIdle, &brkpt);
+		printf("  gp[%d] %s in %u ms -- over %d under %d read %d cmd %d brk %d\n",
+		       g_traceFrame, g_gpDone ? "done" : "STALLED", ms,
+		       overhi, underlow, readIdle, cmdIdle, brkpt);
+	}
+}
+#else
+#define TRACE_HOLD()  0
+#define TRACE(...)    ((void)0)
+#endif
+
+/* Offline map browsing.
+ *
+ * Off in a shipping build. Every shipped .mworld is a scan of a live
+ * MegaSkywars map, and the offline loop walks any of them with a full
+ * inventory and no server involved -- which is most of the game, for free, by
+ * someone who need not own Minecraft at all. Online is the only path that
+ * proves otherwise: the proxy signs in to a real Microsoft account (there is
+ * deliberately no offline-auth option in it) and the server decides what
+ * happens next.
+ *
+ * Turn it back on to work on rendering, physics or the map data without a
+ * proxy, an account or a game in progress -- that is what it is for, and the
+ * test modes above already assume it. */
+#define ALLOW_OFFLINE_PLAY 0
 
 #if NET_TEST_MODE
 static void NetTest(void) {
@@ -226,9 +333,9 @@ static void NetTest(void) {
 	u8  lastType = 0;
 	while (1) {
 		VIDEO_WaitVSync();
-		PAD_ScanPads();
-		if (PAD_ButtonsDown(0) & PAD_BUTTON_START) break;
-		if (PAD_ButtonsDown(0) & PAD_BUTTON_A) Net_Reconnect();
+		Pad_Scan();
+		if (Pad_ButtonsDown(0) & MSW_BTN_START) break;
+		if (Pad_ButtonsDown(0) & MSW_BTN_A) Net_Reconnect();
 
 		NetMsg m;
 		while (Net_Poll(&m)) { msgs++; lastType = m.type; }
@@ -458,6 +565,12 @@ static void ScriptedInput(PlayerInput *in, Player *player, int frame) {
 }
 #endif
 
+/* The offline loop. Kept compiled even when ALLOW_OFFLINE_PLAY is 0 -- it is
+ * how rendering, physics and the map data get worked on without a proxy, and
+ * flipping one #define is a better switch than a thousand lines behind #if.
+ * --gc-sections drops it from the DOL when nothing calls it; the map blobs stay
+ * because RunNetwork still indexes g_maps[] to load whatever the server picked. */
+__attribute__((unused))
 static void RunWorld(World *w, u32 curr) {
 	Mtx v;
 	Player player;
@@ -509,7 +622,7 @@ static void RunWorld(World *w, u32 curr) {
 	double accum = 0.0;
 
 	while (SYS_MainLoop()) {
-		PAD_ScanPads();
+		Pad_Scan();
 		Input_Sample(&in, 0);
 #if INTERACT_TEST_MODE
 		ScriptedInput(&in, &player, ++testFrame);
@@ -650,7 +763,8 @@ static void RunWorld(World *w, u32 curr) {
 		GX_InvalidateTexAll();
 
 		/* Reload the perspective projection each frame -- the HUD pass leaves an
-		 * orthographic matrix loaded. */
+		 * orthographic matrix loaded, and so does the held-item pass below. */
+		UpdateProjection();
 		GX_LoadProjectionMtx(g_proj, GX_PERSPECTIVE);
 		World_Draw(w, v);
 
@@ -671,9 +785,13 @@ static void RunWorld(World *w, u32 curr) {
 
 		if (!MODEL_TEST_MODE) {
 			/* First-person held item, on top of the world but under the HUD.
-			 * Hidden while the full inventory screen is open (like vanilla). */
-			if (!invOpen)
+			 * Hidden while the full inventory screen is open (like vanilla).
+			 * Drawn under the fixed-FOV projection -- see g_projHand. Nothing
+			 * else in this frame is 3D, so it is not put back. */
+			if (!invOpen) {
+				GX_LoadProjectionMtx(g_projHand, GX_PERSPECTIVE);
 				HeldItem_Draw(&player, rmode->fbWidth, rmode->efbHeight, alpha);
+			}
 			Hud_Draw(&player, rmode->fbWidth, rmode->efbHeight, invOpen, invCursor);
 		}
 
@@ -740,18 +858,40 @@ static int NetBringUp(void) {
 	VIDEO_Flush();
 
 	printf("\x1b[2J\x1b[1;1H  MEGA SKYWARS  -  multiplayer\n\n");
+#ifdef HW_RVL
+	/* The Wii has no Broadband Adapter and does not need one: libogc's
+	 * if_config is the console's own network stack here, which is the whole
+	 * reason this build exists (Nintendont cannot carry the GameCube build's
+	 * BBA traffic -- its "BBA emulation" patches Nintendo SDK socket calls,
+	 * and libbba drives the adapter's hardware directly). */
+	printf("  bringing up the network (DHCP)...\n");
+#else
 	printf("  bringing up the broadband adapter (DHCP)...\n");
+#endif
 	if (!Net_Init(20)) {
 		printf("\n  FAILED: %s\n", Net_LastError());
+#ifdef HW_RVL
+		printf("  Check the console's network settings.\n");
+#else
 		printf("  In Dolphin: Config > GameCube > SP1 > Broadband Adapter.\n");
-		printf("\n  Press Start to go back.\n");
+#endif
+		printf(ALLOW_OFFLINE_PLAY ? "\n  Press Start to go back.\n"
+		                          : "\n  Press Start to try again.\n");
 		while (1) {
 			VIDEO_WaitVSync();
-			PAD_ScanPads();
-			if (PAD_ButtonsDown(0) & PAD_BUTTON_START) return 0;
+			Pad_Scan();
+			if (Pad_ButtonsDown(0) & MSW_BTN_START) return 0;
 		}
 	}
 	printf("  ip %s  gateway %s\n", Net_LocalIp(), Net_Gateway());
+#ifdef HW_RVL
+	/* Which of the three controller backends answered. Worth a line on screen:
+	 * it is the difference between "the adapter is not detected" and "the
+	 * adapter is detected and the mapping is wrong", and there is no other way
+	 * to tell those apart on a console. */
+	Pad_Scan();
+	printf("  controller: %s\n", Pad_SourceName(0));
+#endif
 	printf("  dialling %s:%d ...\n", NET_PROXY_IP, GCLINK_PORT);
 	return 1;
 }
@@ -776,6 +916,9 @@ static void RunNetwork(u32 curr) {
 	float alpha = 0.0f;
 	NetState lastState = NET_DOWN;
 
+#if NET_TRACE_FRAMES
+	GX_SetDrawDoneCallback(trace_done_cb);
+#endif
 	NetGame_Init(&ng);
 	Input_Init(&in);
 	Interact_Init(&interact);
@@ -790,14 +933,44 @@ static void RunNetwork(u32 curr) {
 	double accum = 0.0;
 
 	while (SYS_MainLoop()) {
-		PAD_ScanPads();
+		TRACE("--- frame %d: pad", g_traceFrame);
+		Pad_Scan();
+		TRACE("input");
 		Input_Sample(&in, 0);
+
+		/* The inventory and the command palette are mutually exclusive, and the
+		 * D-pad is why they were not.
+		 *
+		 * PAD_BUTTON_UP raises `menu` *and* `navY` from the one press, because
+		 * out in the world those are the same press and nothing can see both at
+		 * once. With the inventory open they are not: navY is walking the item
+		 * grid, so every step up it also opened the palette across the top.
+		 * Suppressing the edge here is the fix rather than remapping the pad --
+		 * this is the only place that knows both screens exist, and the binding
+		 * is right everywhere else.
+		 *
+		 * Start comes with it, in the direction it already means everywhere
+		 * else in this UI: CmdMenu_Update treats it as "out of here" from any
+		 * level of the palette, so inside the inventory it closes the inventory
+		 * rather than opening a second screen on top of one.
+		 */
+		if (invOpen) {
+			if (in.pause) {
+				invOpen = 0;
+				/* Same as the X-toggle below: the cursor stack belongs to the
+				 * server and it will restate the slot. */
+				player.inventory.carried = (ItemStack){-1, 0, 0};
+			}
+			in.menu = 0;
+			in.pause = 0;
+		}
 
 		/* Start opens the palette, which doubles as the pause menu; it does
 		 * not leave network mode, because leaving is one of its entries and
 		 * dropping the link by reflex is not what the button should do
 		 * mid-game. */
 		if (in.pause && !cmd.open) { in.pause = 0; in.menu = 1; }
+		TRACE("cmdmenu");
 		int menuFocus = CmdMenu_Update(&cmd, &in);
 
 		const char *say = CmdMenu_TakeChat(&cmd);
@@ -828,6 +1001,21 @@ static void RunNetwork(u32 curr) {
 			if (invOpen) {
 				if (in.navX) invCursor = InvCursorMove(invCursor, in.navX, 0);
 				if (in.navY) invCursor = InvCursorMove(invCursor, 0, in.navY);
+				/* A and B are the two mouse buttons, the same as offline --
+				 * but the window belongs to the server here, so the click goes
+				 * out as well as being applied.
+				 *
+				 * Applied *and* sent, in that order and deliberately: vanilla
+				 * predicts the click and lets S2F/S30 correct it, and the
+				 * alternative is a cursor that does nothing until a round trip
+				 * completes. The server's answer overwrites this either way,
+				 * cursor stack included -- that is what GCLINK_INV_CURSOR is
+				 * for. */
+				if (in.confirm || in.cancel) {
+					int button = in.cancel ? GCLINK_CLICK_RIGHT : GCLINK_CLICK_LEFT;
+					Inventory_SlotClick(&player.inventory, invCursor, button);
+					NetGame_SendWindowClick(&ng, invCursor, button);
+				}
 			} else {
 				if (in.hotbarDelta) {
 					Inventory_ChangeCurrentItem(&player.inventory, in.hotbarDelta);
@@ -849,6 +1037,9 @@ static void RunNetwork(u32 curr) {
 		if (st == NET_READY && lastState != NET_READY) NetGame_Reset(&ng);
 		lastState = st;
 
+		TRACE("net_poll (state %s, in %u out %u)",
+		      Net_StateText(), Net_BytesIn(), Net_BytesOut());
+
 		/* Drain the link. A pending map change stops the drain, so the
 		 * join-time block diff behind it is applied to the right world. */
 		if (NetGame_Poll(&ng, haveWorld ? &world : NULL,
@@ -856,7 +1047,35 @@ static void RunNetwork(u32 curr) {
 			int idx = ng.wantMap;
 			if (haveWorld) { World_Free(&world); haveWorld = 0; }
 			u32 size = (u32)(g_maps[idx].end - g_maps[idx].data);
+			TRACE("world_load [%d] %s, %u B (arena1 %u KB free)",
+			      idx, g_maps[idx].name, size,
+			      (unsigned)(SYS_GetArena1Size() / 1024));
 			haveWorld = World_Load(&world, g_maps[idx].data, size);
+			TRACE("world_load -> %d (arena1 %u KB free)", haveWorld,
+			      (unsigned)(SYS_GetArena1Size() / 1024));
+#if NET_TRACE_FRAMES
+			/* Where the GP's data landed. Every one of these is read by the
+			 * graphics processor by physical address, so an allocation that
+			 * spilled out of MEM1 is the difference between a frame that draws
+			 * and a GP that stops part-way through the command stream. */
+			if (haveWorld && TRACE_HOLD()) {
+				WorldStats ws;
+				u32 i, lo = 0xFFFFFFFFu, hi = 0, nDl = 0;
+				World_GetStats(&world, &ws);
+				for (i = 0; i < ws.chunks; i++) {
+					u32 a = (u32)world.chunkDl[i];
+					if (!a) continue;
+					nDl++;
+					if (a < lo) lo = a;
+					if (a + world.chunkDlCap[i] > hi) hi = a + world.chunkDlCap[i];
+				}
+				printf("  %u chunks, %u faces, dl %u KB in %u lists %08X..%08X\n",
+				       ws.chunks, ws.faces, ws.dlBytes / 1024, nDl, lo, hi);
+				printf("  clr %p x%u  tex %p x%u  pad %p\n",
+				       world.clrArr, ws.clrCount, world.texArr, ws.texCount,
+				       world.meshPad);
+			}
+#endif
 			/* Marked loaded either way: a map that will not load is not going
 			 * to load on the next frame either, and retrying it every frame
 			 * would wedge the drain instead of just missing the geometry. */
@@ -890,6 +1109,8 @@ static void RunNetwork(u32 curr) {
 
 		accum += dtUs;
 		if (accum > MAX_ACCUM_US) accum = MAX_ACCUM_US;
+		TRACE("tick x%d (world %d, ents %d)", (int)(accum / TICK_US),
+		      haveWorld, Entity_Count(&ng.ents));
 		u64 tickTB = gettime();
 		while (accum >= TICK_US) {
 			NetGame_Tick(&ng);
@@ -915,6 +1136,7 @@ static void RunNetwork(u32 curr) {
 		double tickUs = (double)ticks_to_microsecs(gettime() - tickTB);
 		alpha = (float)(accum / TICK_US);
 
+		TRACE("remesh");
 		double eyeX = 0.0, eyeY = 0.0, eyeZ = 0.0;
 		if (haveWorld) {
 			Player_GetViewMatrix(&player, alpha, v);
@@ -927,11 +1149,14 @@ static void RunNetwork(u32 curr) {
 			guMtxIdentity(v);
 		}
 
+		TRACE("gx setup");
 		GX_SetViewport(0, 0, rmode->fbWidth, rmode->efbHeight, 0, 1);
 		GX_InvVtxCache();
 		GX_InvalidateTexAll();
+		UpdateProjection();
 		GX_LoadProjectionMtx(g_proj, GX_PERSPECTIVE);
 
+		TRACE("draw world");
 		if (haveWorld) {
 			World_Draw(&world, v);
 			/* The targeted block's outline and, while mining, the crack
@@ -946,11 +1171,18 @@ static void RunNetwork(u32 curr) {
 					                       interact.curBy, interact.curBz, stage);
 			}
 		}
+		TRACE("draw entities");
 		Entity_Draw(&ng.ents, v, alpha);
 
-		if (haveWorld && !invOpen && player.gameMode != GCLINK_MODE_SPECTATOR)
+		/* Under the fixed-FOV projection -- see g_projHand. The nametag pass
+		 * below projects on the CPU from the g_proj copy it is handed, so it is
+		 * unaffected by what is loaded in GX. */
+		if (haveWorld && !invOpen && player.gameMode != GCLINK_MODE_SPECTATOR) {
+			GX_LoadProjectionMtx(g_projHand, GX_PERSPECTIVE);
 			HeldItem_Draw(&player, rmode->fbWidth, rmode->efbHeight, alpha);
+		}
 
+		TRACE("tags");
 		int nTags = tagsOn
 		          ? Entity_CollectTags(&ng.ents, haveWorld ? &world : NULL,
 		                               v, g_proj, eyeX, eyeY, eyeZ,
@@ -962,6 +1194,7 @@ static void RunNetwork(u32 curr) {
 		/* Spectator hides the hotbar, the hearts and the crosshair -- there is
 		 * nothing to hold and nothing to aim -- and Hud_DrawNetOverlay puts the
 		 * SPECTATING banner up in their place. */
+		TRACE("hud");
 		if (haveWorld && player.gameMode != GCLINK_MODE_SPECTATOR)
 			Hud_Draw(&player, rmode->fbWidth, rmode->efbHeight, invOpen, invCursor);
 		Hud_DrawNetOverlay(&ng.hud, rmode->fbWidth, rmode->efbHeight);
@@ -986,15 +1219,29 @@ static void RunNetwork(u32 curr) {
 		CmdMenu_Draw(&cmd, rmode->fbWidth, rmode->efbHeight);
 		Hud_DrawNetStatus(rmode->fbWidth, rmode->efbHeight);
 
+		TRACE("overlays");
 		GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
 		GX_SetColorUpdate(GX_TRUE);
-		GX_CopyDisp(xfb[curr], GX_TRUE);
+		/* While tracing, every frame is copied to xfb[1] and never shown, so the
+		 * breadcrumbs written into xfb[0] stay on screen and stay readable. */
+		GX_CopyDisp(xfb[TRACE_HOLD() ? 1 : curr], GX_TRUE);
+		TRACE("copydisp");
+#if NET_TRACE_FRAMES
+		trace_drawdone();
+#else
 		GX_DrawDone();
+#endif
+		TRACE("drawdone");
 
-		VIDEO_SetNextFramebuffer(xfb[curr]);
-		VIDEO_Flush();
+		if (!TRACE_HOLD()) {
+			VIDEO_SetNextFramebuffer(xfb[curr]);
+			VIDEO_Flush();
+		}
 		VIDEO_WaitVSync();
-		curr ^= 1;
+		if (!TRACE_HOLD()) curr ^= 1;
+#if NET_TRACE_FRAMES
+		if (g_traceFrame < NET_TRACE_FRAMES) g_traceFrame++;
+#endif
 	}
 
 	Net_Disconnect(NULL);
@@ -1005,7 +1252,13 @@ int main(int argc, char **argv) {
 	GXColor background = {135, 190, 235, 0xff}; /* sky blue */
 
 	VIDEO_Init();
-	PAD_Init();
+	Pad_Init();
+
+	/* Settings before anything reads them: Input_Sample consults the binding
+	 * table on its first call and UpdateProjection consults the FOV. Pure
+	 * assignment, no I/O -- these last the session and are not persisted, see
+	 * settings.h for why. */
+	Settings_Defaults();
 
 	/* Block drops use rand() for their spawn offset, quantity and the
 	 * 1-in-N drop rolls (gravel's flint, tall grass's seeds). */
@@ -1044,7 +1297,8 @@ int main(int argc, char **argv) {
 
 	f32 w = rmode->viWidth;
 	f32 h = rmode->viHeight;
-	guPerspective(g_proj, 60, w / h, 1.0f, 8000.0f);
+	guPerspective(g_projHand, (f32)SETTINGS_FOV_DEF, w / h, 1.0f, 8000.0f);
+	UpdateProjection();
 	GX_LoadProjectionMtx(g_proj, GX_PERSPECTIVE);
 
 	GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
@@ -1070,6 +1324,16 @@ int main(int argc, char **argv) {
 
 	/* Set to a map index to bypass the menu (rendering smoke test); -1 = menu. */
 #define TEST_AUTOLOAD (-1)
+
+#if !ALLOW_OFFLINE_PLAY && !MODEL_TEST_MODE && TEST_AUTOLOAD < 0
+	/* No map menu to return to, so a disconnect goes back to the bring-up
+	 * rather than out of the program: "leave this game" should not mean
+	 * "reboot the console". */
+	while (1) {
+		if (NetBringUp()) RunNetwork(0);
+		else VIDEO_WaitVSync();
+	}
+#else
 	while (1) {
 #if MODEL_TEST_MODE
 		/* Looked up by name rather than a hardcoded index so the gallery's
@@ -1115,6 +1379,7 @@ int main(int argc, char **argv) {
 		break;
 #endif
 	}
+#endif  /* !ALLOW_OFFLINE_PLAY */
 
 	return 0;
 }

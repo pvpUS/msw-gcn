@@ -80,6 +80,19 @@ const VEL_SCALE = 8000;
 const COLLIDE_STEP = 0.25;
 
 /**
+ * Distance bands for the update filter, in blocks squared.
+ *
+ * The position and rotation deadbands scale with distance because the error
+ * they permit is an *angular* one: three centimetres at sixty blocks is a good
+ * deal less than a pixel at 480p, and at 20 Hz across a dozen entities those
+ * sub-pixel updates are a real fraction of a link that has ten KB/s to give.
+ * Two bands, coarse on purpose -- the point is to drop what cannot be seen,
+ * not to model the projection.
+ */
+const FAR_SQ = 32 * 32;
+const VERY_FAR_SQ = 64 * 64;
+
+/**
  * How long an arrow must hold still before it counts as stuck in a block.
  *
  * A 1.8 arrow that hits something sets inGround and simply stops. The server
@@ -138,7 +151,13 @@ class EntityTranslator {
         // server says so.
         this.isSolid = isSolid;
         this.cap = config.cap ?? 128;
-        this.minDelta = Math.round((config.minMoveDelta ?? 0.03) * POS_SCALE) || 1;
+        this.minDelta = Math.round((config.minMoveDelta ?? 0.06) * POS_SCALE) || 1;
+        // Byte turns, so 2 is about 2.8 degrees. Without a rotation deadband at
+        // all -- which is what an exact `yaw !== sentYaw` is -- a player who is
+        // merely standing there looking around costs the same 18 bytes a tick
+        // as one sprinting past, and in a sixteen-player game most of them are
+        // standing there looking around.
+        this.minTurn = config.minTurn ?? 2;
 
         this.map = null;         // origin for the absolute -> local conversion
         this.selfEid = -1;
@@ -151,7 +170,8 @@ class EntityTranslator {
 
         this.pendingAnims = [];
         this.pendingEquip = [];
-        this.stats = { added: 0, dropped: 0, evicted: 0, moves: 0, landed: 0, stepped: 0 };
+        this.stats = { added: 0, dropped: 0, evicted: 0, moves: 0, landed: 0,
+                       stepped: 0, throttled: 0 };
     }
 
     setMap(m) { this.map = m; this.clear(); }
@@ -476,19 +496,68 @@ class EntityTranslator {
             if (!e.added && !e.hidden) { this.sendAdd(e); e.added = true; e.moved = false; }
         }
 
-        // Batch the moves. A frame's worth of ENTITY_MOVE for 128 entities is
-        // 2.3 KB, which is nothing on a LAN and one console-side read instead
-        // of 128 -- the console drains this inside a 16 ms frame.
+        // Batch the moves -- but not while the console is already behind.
+        //
+        // ENTITY_MOVE is the bulk of this link's traffic and the only part of
+        // it that is pure state: every record is an absolute position, so the
+        // next batch says everything this one would have. Queueing another two
+        // kilobytes of positions onto a link the console is reading half a
+        // second late is therefore strictly worse than skipping the tick -- and
+        // the delay it adds is not paid by the entities alone, because the
+        // block diff, the hit feedback and the keepalive are all behind it in
+        // the same TCP stream. Skipping costs one stale tick; queueing costs
+        // every frame until the backlog drains.
+        //
+        // Nothing below this is skipped: adds, removals, equipment and
+        // animations are events, and there is no later frame that carries them.
+        if (this.link.congested) {
+            this.stats.throttled++;
+        } else {
+            this.sendMoves(selfX, selfY, selfZ);
+        }
+
+        for (const [eid, slot, item] of this.pendingEquip) {
+            if (!this.entities.has(eid)) continue;
+            this.link.send(S.ENTITY_EQUIP, new Writer(7).i32(eid).u8(slot).u16(item).done());
+        }
+        this.pendingEquip.length = 0;
+
+        for (const [eid, anim] of this.pendingAnims) {
+            if (!this.entities.has(eid)) continue;
+            this.link.send(S.ENTITY_ANIM, new Writer(5).i32(eid).u8(anim).done());
+        }
+        this.pendingAnims.length = 0;
+
+        this.reapLanded();
+    }
+
+    /**
+     * One batched ENTITY_MOVE for everything that has moved enough to be worth
+     * eighteen bytes, nearer entities held to a tighter threshold than far ones.
+     *
+     * `moved` is cleared for everything considered, including what the deadband
+     * rejects, but `sentX/Y/Z` is only advanced for what actually goes out --
+     * so a slow drift accumulates against the last *sent* position and crosses
+     * the threshold eventually rather than being rounded away every tick.
+     */
+    sendMoves(selfX, selfY, selfZ) {
+        const sx = selfX * POS_SCALE, sy = selfY * POS_SCALE, sz = selfZ * POS_SCALE;
         const moving = [];
         for (const e of this.entities.values()) {
             if (!e.moved || e.hidden) continue;
             e.moved = false;
-            const dx = e.x - (e.sentX ?? Infinity);
-            if (e.sentX !== undefined &&
-                Math.abs(dx) < this.minDelta &&
-                Math.abs(e.y - e.sentY) < this.minDelta &&
-                Math.abs(e.z - e.sentZ) < this.minDelta &&
-                e.yaw === e.sentYaw && e.pitch === e.sentPitch) continue;
+            if (e.sentX !== undefined) {
+                const ex = (e.x - sx) / POS_SCALE, ey = (e.y - sy) / POS_SCALE,
+                      ez = (e.z - sz) / POS_SCALE;
+                const dsq = ex * ex + ey * ey + ez * ez;
+                const scale = dsq > VERY_FAR_SQ ? 4 : dsq > FAR_SQ ? 2 : 1;
+                const need = this.minDelta * scale, needTurn = this.minTurn * scale;
+                if (Math.abs(e.x - e.sentX) < need &&
+                    Math.abs(e.y - e.sentY) < need &&
+                    Math.abs(e.z - e.sentZ) < need &&
+                    turnDelta(e.yaw, e.sentYaw) < needTurn &&
+                    turnDelta(e.pitch, e.sentPitch) < needTurn) continue;
+            }
             e.sentX = e.x; e.sentY = e.y; e.sentZ = e.z;
             e.sentYaw = e.yaw; e.sentPitch = e.pitch;
             moving.push(e);
@@ -506,20 +575,6 @@ class EntityTranslator {
             this.link.send(S.ENTITY_MOVE, w.done());
             this.stats.moves += chunk.length;
         }
-
-        for (const [eid, slot, item] of this.pendingEquip) {
-            if (!this.entities.has(eid)) continue;
-            this.link.send(S.ENTITY_EQUIP, new Writer(7).i32(eid).u8(slot).u16(item).done());
-        }
-        this.pendingEquip.length = 0;
-
-        for (const [eid, anim] of this.pendingAnims) {
-            if (!this.entities.has(eid)) continue;
-            this.link.send(S.ENTITY_ANIM, new Writer(5).i32(eid).u8(anim).done());
-        }
-        this.pendingAnims.length = 0;
-
-        this.reapLanded();
     }
 
     /**
@@ -685,8 +740,16 @@ class EntityTranslator {
         return `entities ${this.entities.size} live, ${s.added} added, ` +
                `${s.dropped} filtered out, ${s.stepped} flight steps, ` +
                `${s.landed} arrows landed, ` +
-               `${s.evicted} evicted, ${s.moves} moves sent`;
+               `${s.evicted} evicted, ${s.moves} moves sent` +
+               (s.throttled ? `, ${s.throttled} ticks held back` : '');
     }
+}
+
+/** How far apart two byte turns are, the short way round -- 255 and 1 are two
+ *  apart, not two hundred and fifty four. */
+function turnDelta(a, b) {
+    const d = (a - b) & 0xff;
+    return d > 128 ? 256 - d : d;
 }
 
 /** The first section-sign colour code in a string, as an index into the 16, or
@@ -703,4 +766,4 @@ function firstColourCode(s) {
 function stripCodes(s) { return String(s).replace(/§./g, ''); }
 
 module.exports = { EntityTranslator, OBJECT_TYPES, MOB_TYPES, LANDED_TICKS,
-                   firstColourCode, stripCodes };
+                   firstColourCode, stripCodes, turnDelta };

@@ -117,6 +117,10 @@ void NetGame_SendCombat(NetGame *ng, Combat *c);
 /* The held hotbar slot, when the player changed it locally. Absolute. */
 void NetGame_SendHeldSlot(NetGame *ng, int slot);
 
+/* One click in the inventory screen: an engine slot index and GCLINK_CLICK_*.
+ * The caller applies the click locally as well -- this only tells the server. */
+void NetGame_SendWindowClick(NetGame *ng, int slot, int button);
+
 /* One line of chat or a command. The proxy truncates to 100 characters and
  * rate-limits to about one a second, because Spigot kicks on chat spam. */
 void NetGame_SendChat(NetGame *ng, const char *text);

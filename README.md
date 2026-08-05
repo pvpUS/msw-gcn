@@ -10,7 +10,10 @@ mine and build, and press Start to return to the menu. **Y** instead dials the
 Node proxy (`proxy/`) and plays a live MegaSkywars game over the Broadband
 Adapter.
 
-Controls — the pad has no spare inputs, so this is all of them:
+Controls — the pad has no spare inputs, so this is all of them. Every gameplay
+row is rebindable (or unbindable) from **Settings ▸ Controls** in the command
+palette; the menu column is fixed, so no remap can leave you unable to reach the
+menu that made it.
 
 | | |
 |---|---|
@@ -26,6 +29,31 @@ Controls — the pad has no spare inputs, so this is all of them:
 | D-Pad ▼ | drop item — offline, the perf overlay |
 | **Z** | hold to show the chat log |
 | **Start** | back to the menu, or the pause menu online |
+
+## Settings
+
+**Start ▸ Settings** in the command palette, with D-Pad ◀ ▶ to change a value:
+
+| | |
+|---|---|
+| FOV | 30–110°, default 60. The held item keeps its own fixed 60° so it does not slide off the corner of the screen — the same split vanilla makes. |
+| View bobbing | On/off. This engine's bob is on the held item, not the camera. |
+| Auto sprint | **On by default** — sprints whenever you walk forward, so R is only needed if you turn it off. |
+| Sensitivity | 0.5× to 8× the base C-stick look rate. |
+| Controls | Rebind any gameplay action to any button, or to **None**. A button used twice is drawn in red rather than refused. |
+
+Menu navigation (D-Pad, **A**, **B**, **Start**) is deliberately *not*
+rebindable, so no remap can leave you unable to reach the screen that made it.
+
+**Settings last for the session and are not saved.** Memory card persistence was
+built and working — record format, checksum, validation, slot A/B, full
+save/load round trip verified against a real card — and then removed, because a
+*successful* `CARD_Mount` anywhere in this program stops the world from
+rendering: the frame clears to the sky colour and only the display-list geometry
+vanishes, while the entire 2D HUD keeps drawing. See the note at the top of
+[`source/settings.h`](source/settings.h) for what was ruled out. Persistence can
+return once that is understood; nothing about the settings code needs to change
+for it.
 
 ## World format & compression
 
@@ -104,3 +132,74 @@ make
 
 Produces `msw-gcn.dol` / `msw-gcn.elf`. `.mworld` and `.tpl` files under `data/`
 are embedded via `bin2s`.
+
+### Wii
+
+```sh
+make wii          # msw-wii.dol
+make dist         # dist/apps/msw-gcn/ -- copy apps/ to an SD card for the HBC
+```
+
+Both consoles build from this one tree and differ in exactly three places: the
+toolchain rules, the libraries, and `source/pad.c`. `wii_rules` defines
+`HW_RVL`, which every platform `#ifdef` keys off.
+
+**Networking is why this target exists.** Nintendont cannot carry the GameCube
+build's traffic — its "BBA emulation" pattern-matches Nintendo SDK socket calls
+and redirects them to IOS sockets, while `-lbba` drives the adapter's hardware
+over EXI, so no adapter is ever there and `if_config` fails. On Wii, libogc
+offers the *same* `if_config`/`net_*` API over the console's own network stack,
+so `source/net.c`, GCLink and the proxy are **identical on both platforms** and
+DHCP just works.
+
+Controllers, in the order `pad.c` picks them:
+
+| Source | Notes |
+|---|---|
+| Wii U / Mayflash GameCube adapter | USB, vendor-class. The Mayflash's switch must be in **Wii U** mode (in PC mode it is a different device); only the black data plug is needed. |
+| Native controller ports | RVL-001 only — later models, including the RVL-101, have none. |
+| Classic Controller / Wii U Pro | The fallback, and the only genuine remap. |
+
+The first backend with something connected wins the whole channel rather than
+the sources being merged, because a stick has to come from one place. The boot
+screen prints which one answered — that is the difference between "the adapter
+isn't detected" and "it is detected and the mapping is wrong", which nothing
+else on a console will tell you.
+
+Every backend is translated into *GameCube* button bits and GameCube analog
+ranges (`MSW_BTN_*` in `source/pad.h`), so `input.c` and `settings.c` are the
+same code on both platforms and the two adapter paths feel exactly like the
+console build. Only the Classic Controller is remapped: face buttons and D-pad
+keep their names, the analog shoulders keep theirs, the sticks land on main and
+C, Plus is Start, and **both** ZL and ZR give the GameCube's single Z.
+
+### Disc image
+
+```sh
+make iso
+```
+
+Produces `msw-gcn.iso`, a bootable GameCube disc image (~5 MB — it is not padded
+out to the 1.36 GB a retail disc uses, since nothing needs it to be). Dolphin,
+Swiss and Nintendont take the `.dol` directly; the image is for loaders and
+burners that only accept a disc.
+
+`tools/mkiso.py` lays out the GCM and compiles the apploader in
+`tools/apploader/`. That apploader is written from the published BS2 interface
+rather than lifted from a retail disc, so nothing here depends on owning a
+particular game: the bootrom calls `main()` repeatedly, and each call names the
+next chunk of disc to copy and where it goes, so walking the DOL's section table
+is the whole job. `mkiso.py` patches the disc offset of the `.dol` into the
+built apploader and pads the raw image out to `_end`, because nothing on the
+console clears the apploader's own `.bss`.
+
+Two constraints there that Dolphin does not enforce, so a change breaking either
+boots fine in the emulator and black-screens everywhere else:
+
+- **No transfer may exceed 64 DVD sectors (128 KB)**, so a section bigger than
+  that is handed back a chunk per `main()` call. Dolphin will quite happily read
+  the whole 4.9 MB data section in one go.
+- **Flush the loaded sections, don't invalidate them.** A console's DVD DMA
+  writes behind the data cache, but a loader emulating the drive off SD or USB
+  (Nintendont, Swiss) copies with the CPU and leaves those lines dirty — `dcbi`
+  there throws the game away right before the jump into it.

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<app version="1">
+  <name>Mega Skywars</name>
+  <coder>pvpUS</coder>
+  <version>1.0</version>
+  <short_description>Minecraft Skywars for the Wii</short_description>
+  <long_description>A voxel engine that connects to the live MegaSkywars server through a proxy on your LAN.
+
+Controls: a GameCube controller in a native port (RVL-001), a Wii U / Mayflash GameCube adapter over USB, or a Classic Controller / Wii U Pro Controller.</long_description>
+</app>

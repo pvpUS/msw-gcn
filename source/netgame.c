@@ -168,14 +168,18 @@ static void on_inv_set(NetGame *ng, Player *p, const u8 *d, u16 len) {
 		u16 item = gc_get_u16(q + 1);
 		u8  count = gc_get_u8(q + 3);
 		u16 meta = gc_get_u16(q + 4);
-		if (slot < 0 || slot >= INV_TOTAL_SIZE) continue;
+		if (slot < 0 || slot > GCLINK_INV_CURSOR) continue;
 		ItemStack s;
 		if (item == GCLINK_AIR || count == 0) {
 			s.item = -1; s.meta = 0; s.count = 0;
 		} else {
 			s.item = (s16)item; s.meta = (s16)meta; s.count = (u8)count;
 		}
-		Inventory_SetSlot(&p->inventory, slot, s);
+		/* The cursor is not a slot in the array -- it is the stack being
+		 * carried between them -- but it arrives the same way and for the same
+		 * reason, so it rides the same message. */
+		if (slot == GCLINK_INV_CURSOR) p->inventory.carried = s;
+		else                           Inventory_SetSlot(&p->inventory, slot, s);
 	}
 	(void)ng;
 }
@@ -359,6 +363,18 @@ void NetGame_SendCombat(NetGame *ng, Combat *c) {
 		gc_put_u8(buf + 4, GCLINK_USE_ATTACK);
 		Net_Send(GC_C_USE_ENTITY, buf, 5);
 	}
+}
+
+/* One inventory click. See GC_C_WINDOW_CLICK: the proxy fills in the stack the
+ * server believes is in the slot and the action number, because both are its to
+ * know -- the console's copy of the window is a mirror, not the record. */
+void NetGame_SendWindowClick(NetGame *ng, int slot, int button) {
+	u8 buf[2];
+	(void)ng;
+	if (slot < 0 || slot >= INV_TOTAL_SIZE) return;
+	gc_put_u8(buf,     (u8)slot);
+	gc_put_u8(buf + 1, (u8)(button ? GCLINK_CLICK_RIGHT : GCLINK_CLICK_LEFT));
+	Net_Send(GC_C_WINDOW_CLICK, buf, sizeof buf);
 }
 
 void NetGame_SendHeldSlot(NetGame *ng, int slot) {

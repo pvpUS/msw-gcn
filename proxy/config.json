@@ -35,7 +35,22 @@
   "gclink": {
     "host": "0.0.0.0",
     "port": 25566,
-    "pingIntervalMs": 1000
+    "pingIntervalMs": 250,
+    "_pingIntervalMs": [
+      "A ping is nine bytes, so four a second costs nothing and buys two",
+      "things: a console RTT readout that reacts at the speed a fight does,",
+      "and a congestion signal the translators can steer on. Once a second",
+      "was too coarse to be either."
+    ],
+    "sendHighWater": 3072,
+    "congestedRttMs": 200,
+    "_congestedRttMs": [
+      "Above this round trip the console is behind, and the entity and block",
+      "streams stop queueing state until it recovers. The Broadband Adapter",
+      "drains ~10-15 KB/s and node reports no backpressure until the OS send",
+      "buffer is full, so the round trip is the only honest measure of the",
+      "queue. Raise it and the link buffers more; lower it and it sends less."
+    ]
   },
 
   "world": {
@@ -45,19 +60,28 @@
       "blocks from an origin is unambiguously that map. Beyond every origin is",
       "the hub, which is GCLINK_GAME_LOBBY and has no geometry we can show."
     ],
-    "maxBlocksPerFrame": 4096,
+    "maxBlocksPerFrame": 1024,
     "_maxBlocksPerFrame": [
       "Join-time chunk diffs run to tens of thousands of blocks. The console",
       "re-meshes a bounded number of chunks per frame (T24), so pace the deltas",
-      "rather than handing TCP a megabyte and hoping."
+      "rather than handing TCP a megabyte and hoping. This is a ceiling, not a",
+      "target: the flush also stops the moment gclink.congested goes true, which",
+      "is what actually keeps a join diff from burying a fight."
     ]
   },
 
   "entities": {
     "cap": 128,
     "updateHz": 20,
-    "minMoveDelta": 0.03,
-    "_cap": "16 players + arrows + snowballs + a 192-stone death drop overflows 64."
+    "minMoveDelta": 0.06,
+    "minTurn": 2,
+    "_cap": "16 players + arrows + snowballs + a 192-stone death drop overflows 64.",
+    "_minMoveDelta": [
+      "Blocks. 0.03 rounds to one unit of the wire's 1/32 fixed point, which is",
+      "no filter at all -- every entity that twitches costs 18 bytes a tick.",
+      "Both this and minTurn (in byte turns, 256 to the circle) are doubled",
+      "beyond 32 blocks and doubled again beyond 64."
+    ]
   },
 
   "chat": {

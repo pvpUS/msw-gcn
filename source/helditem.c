@@ -4,6 +4,7 @@
 #include "helditem.h"
 #include "world.h"           /* World_BindAtlas                                */
 #include "inventory.h"
+#include "settings.h"        /* g_settings.viewBob                             */
 #include "atlas_gen.h"       /* ATLAS_COLS/CELL/PAD/TILE/TEX_W/TEX_H           */
 #include "block_faces_gen.h" /* NUM_BLOCK_IDS, g_topTile[], g_bottomTile[]     */
 
@@ -14,9 +15,13 @@
 
 /* ---- placement tunables (view space; camera at the origin looking down -Z,
  * +X right, +Y up). The item hangs in the lower-right corner. The perspective
- * projection is the one main.c leaves loaded (60 deg FOV, near plane 1.0), so
- * everything sits a little beyond z=-1 to clear the near plane even after the
- * cube's corners swing out under rotation. ------------------------------------*/
+ * projection is the one main.c loads before this pass -- a fixed
+ * SETTINGS_FOV_DEF, *not* the player's FOV setting, the same split vanilla makes
+ * by computing the hand's projection with useFOVSetting = false. These offsets
+ * are tuned against one frustum; at 110 degrees the item would slide off the
+ * corner of the screen and at 30 it would fill a third of it. Everything sits a
+ * little beyond z=-1 to clear the near plane (1.0) even after the cube's corners
+ * swing out under rotation. ---------------------------------------------------*/
 
 /* Held block (3D cube). */
 #define HB_X      0.86f
@@ -149,12 +154,21 @@ void HeldItem_Draw(const Player *p, int fbWidth, int efbHeight, float alpha) {
 	/* Gentle view-bob: a small figure-eight sway that grows with walk speed and
 	 * settles to zero at rest (so a static screenshot shows the neutral pose).
 	 * The phase lives on the Pose and advances at the tick rate; this reads it
-	 * interpolated, so the sway no longer depends on the frame time. */
-	float phase = Pose_Bob(&p->pose, alpha);
-	float amp = p->pose.prevLimbSwingAmount +
-	            (p->pose.limbSwingAmount - p->pose.prevLimbSwingAmount) * alpha;
-	float bobX =  sinf(phase)        * 0.025f * amp;
-	float bobY = -fabsf(cosf(phase)) * 0.030f * amp;
+	 * interpolated, so the sway no longer depends on the frame time.
+	 *
+	 * This is the whole of what the "View bobbing" setting turns off: the sway
+	 * is on the item, not on the camera -- there is no camera bob in this engine
+	 * to disable (Player_GetViewMatrix is position plus yaw/pitch, and the one
+	 * camera-space effect is the hurt tilt, which is damage feedback rather than
+	 * a walk animation). */
+	float bobX = 0.0f, bobY = 0.0f;
+	if (g_settings.viewBob) {
+		float phase = Pose_Bob(&p->pose, alpha);
+		float amp = p->pose.prevLimbSwingAmount +
+		            (p->pose.limbSwingAmount - p->pose.prevLimbSwingAmount) * alpha;
+		bobX =  sinf(phase)        * 0.025f * amp;
+		bobY = -fabsf(cosf(phase)) * 0.030f * amp;
+	}
 
 	/* ItemRenderer.transformFirstPersonItem's swing arc, on top of this
 	 * engine's own resting placement. `f` peaks late and `f1` early, which is
@@ -172,9 +186,9 @@ void HeldItem_Draw(const Player *p, int fbWidth, int efbHeight, float alpha) {
 
 	/* Squeeze this pass's depth into the near [0,0.1] slice so the item draws in
 	 * front of essentially all world geometry (which spans [0,1]) while its own
-	 * faces still depth-sort correctly against each other. The perspective
-	 * projection main.c loaded before World_Draw is still current -- we only set
-	 * the model-view. */
+	 * faces still depth-sort correctly against each other. The fixed-FOV hand
+	 * projection main.c loads before calling this is already current -- we only
+	 * set the model-view. */
 	GX_SetViewport(0, 0, fbWidth, efbHeight, 0.0f, 0.1f);
 
 	Mtx mv;

@@ -937,6 +937,24 @@ static void remesh_chunk(World *w, int cx, int cz, PadGrid *p, int tighten) {
 	w->chunkFaces[ci] = fc.faceCount;
 	w->faces += fc.faceCount;
 
+	/* A display list is recorded through the **write-gather pipe**, which goes
+	 * straight to memory and never through the data cache. So the cache and
+	 * this buffer are two independent views of the same address range, and a
+	 * line the CPU still holds from whatever owned this memory before -- the LZ
+	 * scratch, an earlier chunk's tightened copy -- is a live grenade: evicted
+	 * after recording, its writeback lands *on top of* the list, and the GP
+	 * executes whatever the old data decodes to. That does not corrupt a
+	 * triangle, it wedges the graphics processor: it stops mid-command waiting
+	 * for operands that never come, GX_DrawDone never returns, and the console
+	 * hangs with the last frame still on screen.
+	 *
+	 * Dropping the lines first is the whole fix. It costs a handful of dcbi per
+	 * chunk and it is invisible in Dolphin, which has no data cache to get this
+	 * wrong -- which is exactly why it survived to a console. The buffer is
+	 * memalign(32) with a 32-byte-multiple size, so the range is whole cache
+	 * lines and nothing else's dirty data is discarded with it. */
+	DCInvalidateRange(w->chunkDl[ci], w->chunkDlCap[ci]);
+
 	mesh_vtxdesc();   /* the display list is recorded against this descriptor */
 	GX_BeginDispList(w->chunkDl[ci], w->chunkDlCap[ci]);
 	fc.faceIdx = 0; fc.batchLeft = 0; fc.emit = 1;
@@ -946,6 +964,11 @@ static void remesh_chunk(World *w, int cx, int cz, PadGrid *p, int tighten) {
 	 * count -- leaving the primitive unterminated would corrupt the list. */
 	if (fc.batchLeft != 0) GX_End();
 	w->chunkDlLen[ci] = GX_EndDispList();
+
+	/* And again on the way out, so a CPU read of the list -- `tighten`'s memcpy
+	 * below is the only one -- sees what the GP will see rather than a line
+	 * pulled in while the pipe was writing behind the cache's back. */
+	DCInvalidateRange(w->chunkDl[ci], w->chunkDlCap[ci]);
 
 	/* The allocation above is an upper bound; `tighten` hands the slack back.
 	 *

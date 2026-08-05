@@ -33,8 +33,15 @@ const { StateTranslator } = require('./state');
 const { NetPlayer } = require('./netplayer');
 
 const TICK_MS = 50;           // 20 Hz, the server's tick and the console's
+const LINK_STATS_MS = 5000;   // how often to report what the console link carried
 const AUTH = 'microsoft';     // not configurable -- see loadConfig()
 const MC_PORT = 25565;        // "no port given"; only then is SRV consulted
+
+// What we answer MC|Brand with. MegaSkywars looks for "Gamecube" in the brand
+// and parses what follows the slash as a version, then announces the join as
+// "<player> has joined from msw gamecube (V1.0)". Bump the number when the
+// console side changes enough that the server ought to be able to tell.
+const CLIENT_BRAND = 'Gamecube/1.0';
 const SRV_FALLBACK_DNS = ['1.1.1.1', '8.8.8.8'];
 
 // ---- arguments and configuration -------------------------------------------
@@ -126,6 +133,8 @@ async function main() {
         port: config.gclink.port,
         paletteHash: blockmap.paletteHash,
         pingIntervalMs: config.gclink.pingIntervalMs,
+        sendHighWater: config.gclink.sendHighWater,
+        congestedRttMs: config.gclink.congestedRttMs,
         log, recorder,
     });
     await link.listen();
@@ -184,6 +193,14 @@ async function main() {
     link.on('message', (type, payload) =>
         onConsoleMessage(type, payload, { player, log }));
 
+    // Live too, not just --replay. The console's own screen cannot show what it
+    // believes its position and pitch are, so when the view is wrong -- aimed at
+    // the sky, or parked outside the geometry -- this one line a second is the
+    // only thing that distinguishes "the camera is somewhere else" from "nothing
+    // is rendering". It was replay-only, which is precisely the mode where the
+    // question does not come up.
+    installConsoleMonitor(link, log);
+
     // Once, not per reconnect: an SRV record that has just changed is not the
     // failure this is here to survive, and a resolver round trip on every
     // backoff attempt would only slow reconnection down.
@@ -199,6 +216,23 @@ async function main() {
         entities.flush(state.x, state.y, state.z);
     }, TICK_MS);
 
+    // Two cadences, because they answer different questions. The link line is
+    // about the last few seconds -- what was on the wire during that fight,
+    // and how far behind the console got -- and a 30 second average is exactly
+    // the wrong shape for it: the link is idle at rest and the interesting
+    // part is two seconds long. The totals stay where they were.
+    const linkStats = setInterval(() => {
+        if (!link.attached) return;
+        const s = link.takeStats();
+        const secs = LINK_STATS_MS / 1000;
+        const top = s.rows.slice(0, 4)
+            .map((r) => `${r.name.replace(/^S_/, '')} ${(r.bytes / secs / 1024).toFixed(1)}k`)
+            .join(' ');
+        log.info(`link ${(s.bytes / secs / 1024).toFixed(1)} KB/s  ` +
+                 `rtt ${s.rttMs} ms (peak ${s.peakRttMs})  ` +
+                 `queued ${s.backlog} B  ${top}`);
+    }, LINK_STATS_MS);
+
     const stats = setInterval(() => {
         log.info(`${world.report()} | ${entities.report()} | ${player.report()} | ` +
                  `console ${link.attached ? `rtt ${link.rttMs} ms` : 'detached'}, ` +
@@ -208,7 +242,7 @@ async function main() {
     installStdinConsole({ state, log });
 
     installShutdown({ link, recorder, log, blockmap, world, entities, state, session,
-                      timers: [tick, stats] });
+                      timers: [tick, stats, linkStats] });
 }
 
 /**
@@ -327,6 +361,29 @@ async function resolveServer(host, port, log) {
 }
 
 // ---- the Minecraft side ------------------------------------------------------
+
+/**
+ * Encode a 1.8 protocol string: VarInt byte length, then UTF-8.
+ *
+ * custom_payload's `data` is a restBuffer in minecraft-data, so the library
+ * writes whatever buffer we hand it and nothing more. Vanilla 1.8 does not send
+ * a bare string there -- C17PacketCustomPayload carries a PacketBuffer that the
+ * client filled with writeString(), which is length-prefixed -- so the prefix is
+ * ours to add. It matters: a server that reads the payload back as a string gets
+ * 'G' (0x47) as the length off an unprefixed one and runs off the end.
+ */
+function mcString(s) {
+    const bytes = Buffer.from(s, 'utf8');
+    const len = [];
+    for (let n = bytes.length;;) {
+        const b = n & 0x7f;
+        n >>>= 7;
+        len.push(n ? b | 0x80 : b);
+        if (!n) break;
+    }
+    return Buffer.concat([Buffer.from(len), bytes]);
+}
+
 function connect(session, ctx) {
     const { config, log, link, state, world, entities, player } = ctx;
     const mc = require('minecraft-protocol');
@@ -365,13 +422,19 @@ function connect(session, ctx) {
         // Plugins read player.getLocale(), and a client with no brand looks
         // like a bot to anything that checks. Both are join-time settings; the
         // rest of the 1.8 conformance table is T22's.
+        //
+        // The brand goes out here rather than during login for the same reason
+        // vanilla's does: MC|Brand is a PLAY-state plugin message, and a server
+        // that has not finished putting the player in a world drops it. Join
+        // Game -- this packet -- is when there is someone to attach it to.
         client.write('settings', {
             locale: 'en_US', viewDistance: 8, chatFlags: 0,
             chatColors: true, skinParts: 0x7f,
         });
         client.write('custom_payload', {
-            channel: 'MC|Brand', data: Buffer.from('vanilla', 'utf8'),
+            channel: 'MC|Brand', data: mcString(CLIENT_BRAND),
         });
+        log.info(`brand: ${CLIENT_BRAND}`);
     });
 
     const on = (name, fn) => client.on(name, (pkt) => {
@@ -444,12 +507,29 @@ function connect(session, ctx) {
 // ---- the console side --------------------------------------------------------
 /**
  * Console -> server. netplayer.js owns the whole translation; this is only the
- * dispatch, and the one thing it adds is a single warning per unrecognised
- * type so a link that has grown a message this proxy does not know about says
- * so once rather than either silently or twenty times a second.
+ * dispatch, and it adds two things.
+ *
+ * A single warning per unrecognised type, so a link that has grown a message
+ * this proxy does not know about says so once rather than either silently or
+ * twenty times a second.
+ *
+ * And a try/catch, which the inbound path has always had and this one did not.
+ * The asymmetry was a real bug rather than an oversight worth keeping: a throw
+ * here escapes the socket's 'data' handler and takes the *process* down, so one
+ * malformed frame -- or one field minecraft-data types more strictly than the
+ * call site assumed -- reads on the console as the server dropping you mid
+ * action, with nothing in the log to say otherwise. A packet the server will
+ * not accept is worth losing; the session is not.
  */
 function onConsoleMessage(type, payload, { player, log }) {
-    if (player.onMessage(type, payload) !== false) return;
+    let handled;
+    try {
+        handled = player.onMessage(type, payload);
+    } catch (e) {
+        log.error(`${typeName(type)} (${payload.length} B): ${e.stack || e.message}`);
+        return;
+    }
+    if (handled !== false) return;
     if (!onConsoleMessage.seen) onConsoleMessage.seen = new Set();
     if (!onConsoleMessage.seen.has(type)) {
         onConsoleMessage.seen.add(type);

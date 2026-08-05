@@ -129,8 +129,9 @@ enum {
 	GC_S_SELF_VELOCITY = 0x31,
 	/* { u8 slot, u16 itemId, u8 count, u16 meta } * n, n = payload / 6.
 	 * slot is an *engine* index -- 0-8 hotbar, 9-35 storage, 36-39 armor
-	 * (boots, legs, chest, helmet), matching Inventory_GetStackInSlot. The
-	 * proxy has already translated out of the 1.8 window-0 numbering.
+	 * (boots, legs, chest, helmet), matching Inventory_GetStackInSlot, plus
+	 * GCLINK_INV_CURSOR for the stack held on the cursor. The proxy has
+	 * already translated out of the 1.8 window-0 numbering.
 	 * count 0 empties the slot. */
 	GC_S_INV_SET       = 0x32,
 	/* u8 slot (0-8), absolute -- Inventory_ChangeCurrentItem is relative */
@@ -181,6 +182,19 @@ enum {
 	/* u8 action (GCLINK_ACTION_*) -- out-of-band intents that are not
 	 * movement and do not deserve a message type each */
 	GC_C_ACTION     = 0x98,
+	/* u8 slot (engine index), u8 button (0 left, 1 right).  [2 B]
+	 *
+	 * One click in the inventory screen. Only the slot and the button travel:
+	 * C0E also carries the stack the client believed was there, and the proxy's
+	 * mirror of the server's window is a better source for that than the
+	 * console's copy of it -- if the two ever disagree, the one the server will
+	 * accept is the proxy's. The action number is the proxy's too.
+	 *
+	 * The console still applies the click locally the moment it sends this, the
+	 * same way vanilla does: S2F/S30 come back either confirming it or putting
+	 * the window back, and a hundred milliseconds of dead cursor is worse than
+	 * a rare correction. */
+	GC_C_WINDOW_CLICK = 0x99,
 };
 
 /* GC_S_HELLO result */
@@ -298,8 +312,23 @@ enum {
 	GCLINK_ACTION_RESYNC     = 3,   /* resend inventory, held slot, health*/
 };
 
+/* GC_C_WINDOW_CLICK button, and C0EPacketClickWindow's mouseButton. */
+enum {
+	GCLINK_CLICK_LEFT  = 0,
+	GCLINK_CLICK_RIGHT = 1,
+};
+
+/* The stack on the cursor, as a GC_S_INV_SET slot index.
+ *
+ * One past the 40 real slots. The server owns this as surely as it owns the
+ * rest of the window -- it arrives as S2F with windowId -1, slot -1 -- and
+ * without a way to state it, a click the server resolved differently from the
+ * console's prediction would leave a phantom stack on the cursor that nothing
+ * could ever clear. */
+#define GCLINK_INV_CURSOR 40
+
 /* No PING for this long means the link is dead even if TCP has not noticed.
- * The proxy sends one a second. */
+ * The proxy sends four a second. */
 #define GCLINK_PING_TIMEOUT_MS 8000
 
 /* ---- payload accessors --------------------------------------------------
@@ -317,6 +346,26 @@ static inline void gc_put_u32(u8 *p, u32 v) {
 }
 static inline void gc_put_s32(u8 *p, s32 v) { gc_put_u32(p, (u32)v); }
 
+/* Keep a value in a general-purpose register across the conversion, so the
+ * compiler cannot put the FPU back where these accessors just took it out.
+ *
+ * Writing the bytes through gc_get_u32/gc_put_u32 is not on its own enough.
+ * GCC recognises "assemble four bytes big-endian, then memcpy into a float" as
+ * a plain load and folds the whole idiom back into a single lfs/lfd off the
+ * packed pointer -- PowerPC is not a STRICT_ALIGNMENT target, so it believes
+ * any load tolerates any address. On this CPU that is not true of the FPU:
+ * Gekko and Broadway raise an **alignment exception** for a floating-point
+ * load or store that is not word-aligned, and every GCLink payload begins at
+ * frame + 3 (u16 length, u8 type), so two addresses in four are illegal.
+ *
+ * It cost a crash on real hardware that never appears in Dolphin, which does
+ * the misaligned access rather than trapping it -- so this is emphatically not
+ * a micro-optimisation to tidy away. An empty asm with the value tied to a
+ * register breaks the pattern for a few pence: the halves are loaded and
+ * stored as integers, which the hardware does handle at any address, and the
+ * FPU only ever sees the aligned stack slot the compiler spills them to. */
+#define GC_KEEP_IN_GPR(x) __asm__("" : "+r"(x))
+
 /* The outbound halves of gc_get_f32/f64, and misaligned for the same reason:
  * a payload is packed, so the float is memcpy'd into an integer and written a
  * byte at a time rather than stored through a float pointer that may land on
@@ -324,13 +373,19 @@ static inline void gc_put_s32(u8 *p, s32 v) { gc_put_u32(p, (u32)v); }
 static inline void gc_put_f32(u8 *p, float f) {
 	u32 v;
 	__builtin_memcpy(&v, &f, sizeof v);
+	GC_KEEP_IN_GPR(v);
 	gc_put_u32(p, v);
 }
 static inline void gc_put_f64(u8 *p, double d) {
 	u64 v;
+	u32 hi, lo;
 	__builtin_memcpy(&v, &d, sizeof v);
-	gc_put_u32(p, (u32)(v >> 32));
-	gc_put_u32(p + 4, (u32)v);
+	hi = (u32)(v >> 32);
+	lo = (u32)v;
+	GC_KEEP_IN_GPR(hi);
+	GC_KEEP_IN_GPR(lo);
+	gc_put_u32(p, hi);
+	gc_put_u32(p + 4, lo);
 }
 static inline u8  gc_get_u8(const u8 *p)  { return p[0]; }
 static inline u16 gc_get_u16(const u8 *p) { return (u16)((p[0] << 8) | p[1]); }
@@ -368,12 +423,17 @@ static inline float gclink_pitch(u8 b) {
 static inline float gc_get_f32(const u8 *p) {
 	u32 v = gc_get_u32(p);
 	float f;
+	GC_KEEP_IN_GPR(v);
 	__builtin_memcpy(&f, &v, sizeof f);
 	return f;
 }
 static inline double gc_get_f64(const u8 *p) {
-	u64 v = ((u64)gc_get_u32(p) << 32) | (u64)gc_get_u32(p + 4);
+	u32 hi = gc_get_u32(p), lo = gc_get_u32(p + 4);
+	u64 v;
 	double d;
+	GC_KEEP_IN_GPR(hi);
+	GC_KEEP_IN_GPR(lo);
+	v = ((u64)hi << 32) | (u64)lo;
 	__builtin_memcpy(&d, &v, sizeof d);
 	return d;
 }

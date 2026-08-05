@@ -22,6 +22,11 @@
  * the only function in the codebase that may read `PAD_*` for gameplay.
  *
  * ---- the button map (all of it; there are no spare inputs) ----------------
+ * The gameplay column is the *default* map and is rebindable -- it lives in
+ * settings.h as g_settings.bind[], one SET_BTN_* per SET_ACT_*, and this table
+ * is what Settings_Defaults installs. The menu column is not rebindable and is
+ * read straight off the pad; see the note in Input_Sample for why.
+ *
  *   L         attack / dig        (analog or the click at the bottom)
  *   Y         use / place
  *   R         sprint              (analog or the click)
@@ -29,10 +34,10 @@
  *   B         sneak               / cancel in a menu
  *   X         inventory screen
  *   D-pad L/R held hotbar slot    / menu left-right
- *   D-pad Up  command palette     (T23)
- *   D-pad Dn  drop item           (offline: the perf overlay toggle)
+ *   D-pad Up  command palette     (T23)              / menu up
+ *   D-pad Dn  drop item           (offline: the perf overlay toggle) / menu down
  *   Z         hold to show chat   (offline: the debug free-fly camera)
- *   Start     pause menu
+ *   Start     -                   / open and close the palette
  */
 
 /* Minecraft.leftClickCounter: ten ticks of lockout after a click that hit

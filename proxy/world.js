@@ -38,7 +38,7 @@ class WorldTranslator extends EventEmitter {
         this.log = log;
         this.getSelfEid = getSelfEid || (() => -1);
         this.matchRadius = config.mapMatchRadius ?? 250;
-        this.maxPerFlush = config.maxBlocksPerFrame ?? 4096;
+        this.maxPerFlush = config.maxBlocksPerFrame ?? 1024;
 
         this.map = null;        // mapdb entry, or null in the hub
         this.world = null;      // the console's map, as the proxy believes it
@@ -47,7 +47,7 @@ class WorldTranslator extends EventEmitter {
         this.prebuf = [];       // columns that arrived before the map was known
         this._xyz = [0, 0, 0];
 
-        this.stats = { sent: 0, frames: 0, diffed: 0, outside: 0, unmapped: 0 };
+        this.stats = { sent: 0, frames: 0, diffed: 0, outside: 0, unmapped: 0, held: 0 };
     }
 
     // ---- map selection -----------------------------------------------------
@@ -287,13 +287,22 @@ class WorldTranslator extends EventEmitter {
      * the console re-meshes a bounded number of chunks per frame, so the flood
      * is paced here rather than handed to TCP all at once. Returns how many
      * blocks went out.
+     *
+     * The budget is a re-mesh budget, not a bandwidth one, and the two are not
+     * the same size: the old default of 4096 blocks is thirty-two kilobytes
+     * handed to a link that carries about twelve a second, or nearly three
+     * seconds of queue built in a single tick. So the congestion test is inside
+     * the loop rather than around it -- it fills the pipe and then stops,
+     * whatever the budget says. Nothing is lost by stopping; `pending` holds
+     * the rest for the next tick.
      */
     flush() {
         if (!this.pending.size || !this.link.attached) return 0;
+        if (this.link.congested) { this.stats.held++; return 0; }
         let budget = this.maxPerFlush;
         let total = 0;
 
-        while (this.pending.size && budget > 0) {
+        while (this.pending.size && budget > 0 && !this.link.congested) {
             const n = Math.min(BLOCK_SET_MAX, budget, this.pending.size);
             const w = new Writer(n * 8);
             let k = 0;
@@ -319,6 +328,7 @@ class WorldTranslator extends EventEmitter {
         const s = this.stats;
         return `blocks ${s.sent} sent in ${s.frames} frames, ${s.diffed} compared, ` +
                `${s.unmapped} unmapped dropped, ${s.outside} outside the map` +
+               (s.held ? `, ${s.held} ticks held back` : '') +
                (this.pending.size ? `, ${this.pending.size} queued` : '');
     }
 }

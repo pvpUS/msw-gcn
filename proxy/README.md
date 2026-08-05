@@ -73,6 +73,38 @@ build height at its recorded origin, and no two maps overlap. It reports the
 margin — currently the closest two origins are 1724 blocks apart and the
 furthest any scan reaches from its own origin is 175.
 
+## The link budget
+
+The Broadband Adapter's lwIP has a small receive window and delayed ACKs, which
+puts its practical ceiling somewhere around **10–15 KB/s**. Nothing tells you
+when you cross it. Node hands a write straight to the kernel whenever the kernel
+will take it, so `socket.writableLength` reads zero while the OS send buffer
+quietly accumulates *seconds* of backlog — and because it is one TCP stream, that
+backlog delays the block diff, the hit feedback and the keepalive equally. The
+symptom is the console's RTT readout climbing to 400–800 ms during a fight while
+every counter in the proxy looks healthy, because the number on the HUD *is* the
+queue depth.
+
+So the queue is measured rather than assumed. `gclink.congested` is true above
+`congestedRttMs` (or above `sendHighWater` bytes held by node), and the rule for
+what to do about it is one distinction:
+
+- **State** — `ENTITY_MOVE`, `BLOCK_SET`. Every frame is superseded by the next
+  one, so these hold off while congested. Skipping costs one stale tick.
+- **Events** — adds, removals, equipment, animations, inventory, teleports.
+  Nothing later carries them, so these always go. Dropping one desyncs the
+  console for good.
+
+That closes the loop: the RTT rises, the state senders back off, the queue
+drains, they resume. Two consequences for anything added here — a new frame type
+has to be classified into one of those two, and anything sent per-entity
+per-tick needs a deadband, because at 20 Hz across 40 entities an 18-byte record
+is 14 KB/s on its own.
+
+`link N KB/s rtt N ms (peak N) queued N B ...` is logged every five seconds with
+a per-type byte breakdown, busiest first. Five seconds because a fight is two
+seconds long and a 30-second average hides it.
+
 ## The outbound path
 
 `netplayer.js` is the riskiest file here, and the risk is not that it crashes.
@@ -90,7 +122,7 @@ anywhere says so:
 | attack ordering | `C09` → `C0A` → `C02`: the server computes damage from *its* held item. |
 | the `C02` filter | attacking an item or an arrow is a kick, not a no-op. |
 | `C0F` auto-ack | miss one `S32` and the server ignores every later window click. |
-| `C15` / `C17` on join | plugins read `player.getLocale()`; a client with no brand looks like a bot. |
+| `C15` / `C17` on join | plugins read `player.getLocale()`; the brand is `Gamecube/1.0`, length-prefixed as vanilla writes it, and is what MegaSkywars announces the join from. |
 
 `selftest.js` asserts every row of that table against fakes, so a regression
 shows up in a second rather than as an account that quietly stops being able to

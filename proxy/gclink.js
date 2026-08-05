@@ -23,6 +23,30 @@ const MAX_PAYLOAD = 8192;
 const HEADER = 3;
 const PING_TIMEOUT_MS = 8000;
 
+/**
+ * When the console counts as behind, and why there are two tests.
+ *
+ * The Broadband Adapter's lwIP drains somewhere around ten to fifteen KB/s. A
+ * sender that exceeds that does not get an error -- it gets a queue, and the
+ * queue is invisible from here: node hands a write straight to the kernel
+ * whenever the kernel will take it, so `writableLength` sits at zero while the
+ * OS send buffer quietly accumulates *seconds* of backlog. That is why the
+ * console's RTT readout climbs through half a second in the middle of a fight
+ * while every counter in this proxy looks healthy.
+ *
+ * So congestion is read off the round trip, which is the one number that
+ * contains the whole queue no matter who is holding it, with the node-side
+ * backlog as a second, faster test for the case where node *is* the one
+ * holding it. Above either, the translators stop queueing state.
+ */
+const SEND_HIGH_WATER = 3072;
+const CONGESTED_RTT_MS = 200;
+
+/** How many outstanding pings to keep send times for. At four a second this is
+ *  four seconds of history, which is longer than any round trip that is not
+ *  already a dead link. */
+const PING_HISTORY = 16;
+
 /** Air. The engine stores air as -1, which does not survive a u16. */
 const AIR = 0xffff;
 /** Entity fixed-point: 32 units per block, straight off the 1.8 wire. */
@@ -43,6 +67,7 @@ const C = {
     HELLO: 0x81, PONG: 0x83,
     MOVE: 0x90, DIG: 0x91, PLACE: 0x92, USE_ENTITY: 0x93, USE_ITEM: 0x94,
     SWING: 0x95, HELD_SLOT: 0x96, CHAT: 0x97, ACTION: 0x98,
+    WINDOW_CLICK: 0x99,
 };
 
 const HELLO = { OK: 0, VERSION: 1, BLOCKMAP: 2, BUSY: 3 };
@@ -282,23 +307,31 @@ class Replayer {
  * the same split the console makes in Net_Poll.
  */
 class GCLinkServer extends EventEmitter {
-    constructor({ host = '0.0.0.0', port = PORT, paletteHash, pingIntervalMs = 1000,
+    constructor({ host = '0.0.0.0', port = PORT, paletteHash, pingIntervalMs = 250,
+                  sendHighWater = SEND_HIGH_WATER, congestedRttMs = CONGESTED_RTT_MS,
                   log = console, recorder = null } = {}) {
         super();
         this.host = host;
         this.port = port;
         this.paletteHash = paletteHash >>> 0;
         this.pingIntervalMs = pingIntervalMs;
+        this.sendHighWater = sendHighWater;
+        this.congestedRttMs = congestedRttMs;
         this.log = log;
         this.recorder = recorder;
 
         this.sock = null;         // the attached console, once HELLO succeeds
         this.ready = false;
         this.rttMs = 0;
+        this.peakRttMs = 0;
         this.bytesOut = 0;
         this.bytesIn = 0;
+        // type -> [frames, bytes]. Which frame type is filling the link is not
+        // something to reason about from first principles -- a fight looks
+        // nothing like a join -- so count it.
+        this.byType = new Map();
         this._token = 1;
-        this._sentAt = 0;
+        this._pings = new Map();  // token -> when it was queued
         this._pinger = null;
 
         this.server = net.createServer((s) => this._accept(s));
@@ -323,6 +356,24 @@ class GCLinkServer extends EventEmitter {
 
     get attached() { return this.ready; }
 
+    /** Bytes node is holding for the console. Only part of the real backlog --
+     *  see SEND_HIGH_WATER -- but the part that grows without any bound at all. */
+    get backlog() { return this.sock ? this.sock.writableLength : 0; }
+
+    /**
+     * Is the console behind?
+     *
+     * Senders of *state* -- entity positions, the block diff -- must hold off
+     * while this is true: every one of those frames is superseded by the next
+     * tick's, so queueing one now buys a stale position later and delays
+     * everything behind it in the stream. Senders of *events* -- adds,
+     * removals, animations, inventory -- must not hold off: there is no later
+     * frame that carries them, and dropping one desyncs the console for good.
+     */
+    get congested() {
+        return this.backlog > this.sendHighWater || this.rttMs > this.congestedRttMs;
+    }
+
     /** Queue one frame. Silently drops when no console is attached -- the
      *  translation layers run whether or not anyone is listening, and making
      *  every call site check would only spread that test around. */
@@ -331,8 +382,27 @@ class GCLinkServer extends EventEmitter {
         const buf = frame(type, payload);
         this.sock.write(buf);
         this.bytesOut += buf.length;
+        const t = this.byType.get(type);
+        if (t) { t[0]++; t[1] += buf.length; } else this.byType.set(type, [1, buf.length]);
         if (this.recorder) this.recorder.record(DIR_TO_CONSOLE, type, payload);
         return true;
+    }
+
+    /**
+     * Bytes and frames per type since the last call, busiest first, and the
+     * peak RTT over the same window. The averages a 30 second counter gives
+     * are exactly the wrong shape for this: the link is fine at rest and the
+     * question is what it is carrying during the two seconds of a fight.
+     */
+    takeStats() {
+        const rows = [...this.byType.entries()]
+            .map(([type, [n, bytes]]) => ({ type, name: typeName(type), n, bytes }))
+            .sort((a, b) => b.bytes - a.bytes);
+        const bytes = rows.reduce((s, r) => s + r.bytes, 0);
+        const peak = this.peakRttMs;
+        this.byType.clear();
+        this.peakRttMs = this.rttMs;
+        return { rows, bytes, peakRttMs: peak, rttMs: this.rttMs, backlog: this.backlog };
     }
 
     disconnect(reason) {
@@ -399,9 +469,17 @@ class GCLinkServer extends EventEmitter {
         if (!this.ready) return this._drop('first frame was not HELLO');
 
         if (type === C.PONG) {
-            if (payload.length >= 4 && payload.readUInt32BE(0) === (this._token >>> 0)) {
-                this.rttMs = Date.now() - this._sentAt;
-                this._token++;
+            if (payload.length < 4) return;
+            const token = payload.readUInt32BE(0);
+            const sentAt = this._pings.get(token);
+            if (sentAt === undefined) return;   // duplicate, or older than the history
+            this.rttMs = Date.now() - sentAt;
+            if (this.rttMs > this.peakRttMs) this.peakRttMs = this.rttMs;
+            // Tokens go out in order, so anything not newer than this one is
+            // answered or lost, and either way it is not being waited on.
+            for (const t of this._pings.keys()) {
+                if (t > token) break;
+                this._pings.delete(t);
             }
             return;
         }
@@ -409,18 +487,36 @@ class GCLinkServer extends EventEmitter {
         this.emit('message', type, payload);
     }
 
+    /**
+     * A new token and a new send time every interval.
+     *
+     * The previous version reused one token until it was answered and stamped
+     * `_sentAt` on every retransmission, so the round trip it reported was
+     * measured from the *last* ping sent to the PONG for some earlier one --
+     * which under exactly the congestion this is here to detect reads back as a
+     * fraction of the real delay. Congestion is now a control input, so it has
+     * to be the real delay.
+     */
     _startPing() {
         this._stopPing();
+        this._pings.clear();
         const ping = () => {
-            const w = new Writer(6).u32(this._token).u16(Math.min(this.rttMs, 65535));
-            this._sentAt = Date.now();
-            this.send(S.PING, w.done());
+            const token = this._token++ >>> 0;
+            this._pings.set(token, Date.now());
+            while (this._pings.size > PING_HISTORY) {
+                this._pings.delete(this._pings.keys().next().value);
+            }
+            this.send(S.PING, new Writer(6)
+                .u32(token).u16(Math.min(this.rttMs, 65535)).done());
         };
         ping();
         this._pinger = setInterval(ping, this.pingIntervalMs);
     }
 
-    _stopPing() { if (this._pinger) { clearInterval(this._pinger); this._pinger = null; } }
+    _stopPing() {
+        if (this._pinger) { clearInterval(this._pinger); this._pinger = null; }
+        this._pings.clear();
+    }
 
     _drop(why) {
         this.log.error(`console link: ${why}`);
@@ -432,6 +528,7 @@ class GCLinkServer extends EventEmitter {
         if (!this.sock) return;
         this.sock = null;
         this.ready = false;
+        this.rttMs = 0;
         this._stopPing();
         this.log.info(`${who}: ${label}`);
         this.emit('detach', label);
@@ -444,6 +541,7 @@ function helloPayload(hash, result) {
 
 module.exports = {
     VERSION, PORT, MAX_PAYLOAD, HEADER, PING_TIMEOUT_MS,
+    SEND_HIGH_WATER, CONGESTED_RTT_MS,
     AIR, POS_SCALE, BLOCK_SET_MAX, ENTITY_MOVE_MAX,
     S, C, HELLO, GAME, ENT, EFLAG, ANIM, ACTION,
     typeName, frame, angleToByte, clamp,

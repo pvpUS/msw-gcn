@@ -5,16 +5,37 @@ ifeq ($(strip $(DEVKITPPC)),)
 $(error "Please set DEVKITPPC in your environment. export DEVKITPPC=<path to>devkitPPC")
 endif
 
+#---------------------------------------------------------------------------------
+# PLATFORM picks the console. Both builds come out of this one tree:
+#
+#   make                 -> msw-gcn.dol, for a GameCube (or Dolphin, or a disc)
+#   make wii             -> msw-wii.dol, for the Homebrew Channel
+#
+# They differ in three places and nowhere else: the toolchain rules, the
+# libraries, and source/pad.c. wii_rules defines HW_RVL, which is what every
+# platform #ifdef in source/ keys off.
+#---------------------------------------------------------------------------------
+PLATFORM	?=	gamecube
+export PLATFORM
+
+ifeq ($(PLATFORM),wii)
+include $(DEVKITPPC)/wii_rules
+TARGET		:=	msw-wii
+BUILD		:=	build_wii
+else
+ifeq ($(PLATFORM),gamecube)
 include $(DEVKITPPC)/gamecube_rules
+TARGET		:=	msw-gcn
+BUILD		:=	build
+else
+$(error PLATFORM must be 'gamecube' or 'wii', not '$(PLATFORM)')
+endif
+endif
 
 #---------------------------------------------------------------------------------
-# TARGET is the name of the output
-# BUILD is the directory where object files & intermediate files will be placed
 # SOURCES is a list of directories containing source code
 # INCLUDES is a list of directories containing extra header files
 #---------------------------------------------------------------------------------
-TARGET		:=	msw-gcn
-BUILD		:=	build
 SOURCES		:=	source
 DATA		:=	data
 INCLUDES	:=
@@ -31,9 +52,16 @@ LDFLAGS		= -g $(MACHDEP) -Wl,-Map,$(notdir $@).map
 #---------------------------------------------------------------------------------
 # any extra libraries we wish to link with the project
 #---------------------------------------------------------------------------------
-# -lbba is the Broadband Adapter's lwIP stack: if_config and the net_* socket
-# calls source/net.c uses live there, not in libogc (which only declares them).
+# On GameCube, -lbba is the Broadband Adapter's lwIP stack: if_config and the
+# net_* socket calls source/net.c uses live there, not in libogc (which only
+# declares them). On Wii the very same API is libogc's own, over the console's
+# network stack -- which is why net.c is identical on both -- and the extra
+# libraries are WPAD's, for the Classic Controller path in pad.c.
+ifeq ($(PLATFORM),wii)
+LIBS	:=	-lwiiuse -lbte -logc -lm
+else
 LIBS	:=	-lbba -logc -lm
+endif
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing
@@ -97,7 +125,10 @@ export INCLUDE	:=	$(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
 export LIBPATHS	:=	-L$(LIBOGC_LIB) $(foreach dir,$(LIBDIRS),-L$(dir)/lib)
 
 export OUTPUT	:=	$(CURDIR)/$(TARGET)
-.PHONY: $(BUILD) clean run
+
+PYTHON	?=	python
+
+.PHONY: $(BUILD) clean run iso wii gamecube dist
 
 #---------------------------------------------------------------------------------
 $(BUILD):
@@ -105,9 +136,38 @@ $(BUILD):
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
 
 #---------------------------------------------------------------------------------
+# the other console, without having to remember the variable
+#---------------------------------------------------------------------------------
+wii:
+	@$(MAKE) --no-print-directory PLATFORM=wii
+
+gamecube:
+	@$(MAKE) --no-print-directory PLATFORM=gamecube
+
+#---------------------------------------------------------------------------------
+# a Homebrew Channel app folder: copy dist/apps/ onto the root of an SD card
+#---------------------------------------------------------------------------------
+dist: wii
+	@mkdir -p dist/apps/msw-gcn
+	@cp $(CURDIR)/msw-wii.dol dist/apps/msw-gcn/boot.dol
+	@cp $(CURDIR)/tools/wii/meta.xml dist/apps/msw-gcn/meta.xml
+	@echo "staged dist/apps/msw-gcn -- copy the apps/ folder to your SD card"
+
+#---------------------------------------------------------------------------------
+# a bootable disc image: the .dol plus the apploader in tools/apploader
+#---------------------------------------------------------------------------------
+iso: $(BUILD)
+	@test "$(PLATFORM)" = gamecube || \
+		(echo "iso builds a GameCube disc image -- drop PLATFORM=wii" && false)
+	@$(PYTHON) $(CURDIR)/tools/mkiso.py
+
+#---------------------------------------------------------------------------------
+# both platforms, whichever one happens to be selected
+#---------------------------------------------------------------------------------
 clean:
 	@echo clean ...
-	@rm -fr $(BUILD) $(OUTPUT).elf $(OUTPUT).dol
+	@rm -fr build build_wii dist
+	@rm -f msw-gcn.elf msw-gcn.dol msw-gcn.iso msw-wii.elf msw-wii.dol
 
 #---------------------------------------------------------------------------------
 else

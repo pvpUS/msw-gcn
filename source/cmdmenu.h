@@ -10,12 +10,13 @@
  * a client that implemented the C0D/C0E/C0F window protocol to do that would
  * still need a mouse. But `/join <map>`, `/team <n>`, `/start`, `/leave` and
  * `/kit` are all plain chat commands, so a client that can send C01 never has
- * to open a window at all. This is a two-level D-pad menu that composes those
- * five strings, drawn with Hud_DrawString in the existing ortho pass -- no new
- * GX state, no free-text entry, and nothing that needs a keyboard.
+ * to open a window at all. This is a D-pad menu that composes those five
+ * strings, drawn with Hud_DrawString in the existing ortho pass -- no new GX
+ * state, no free-text entry, and nothing that needs a keyboard.
  *
  * It doubles as the pause menu, because a pause menu is the same thing: a
- * list, a cursor and a confirm button.
+ * list, a cursor and a confirm button. It is also where the settings live
+ * (settings.h), which is what made it three levels deep rather than two.
  */
 
 /* Non-chat outcomes -- things the palette asks main.c to do rather than
@@ -31,12 +32,17 @@ enum {
 /* Longest command this composes: "/join " plus a map key. */
 #define CMDMENU_TEXT_MAX 48
 
+/* Root, a submenu, and the controls page inside the settings submenu. */
+#define CMDMENU_DEPTH 3
+
 typedef struct {
 	int open;
-	int level;        /* 0 root, 1 inside a submenu          */
-	int rootSel;
-	int subSel;
-	int subKind;      /* which submenu level 1 is showing     */
+	/* A cursor stack rather than the rootSel/subSel pair this used to be:
+	 * backing out of Controls has to land on the settings row it came from, not
+	 * at the top of the list. depth 0 is the root, where kind[] is unused. */
+	int depth;
+	int sel[CMDMENU_DEPTH];
+	int kind[CMDMENU_DEPTH];
 
 	char pending[CMDMENU_TEXT_MAX];  /* a chat line to send, "" = none */
 	int  pendingAction;              /* CMDMENU_ACT_*                  */

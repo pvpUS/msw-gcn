@@ -27,7 +27,8 @@ const chat = require('./chat');
 const { WorldTranslator, popcount16 } = require('./world');
 const { EntityTranslator, firstColourCode,
         LANDED_TICKS: LANDED } = require('./entities');
-const { StateTranslator, windowSlotToEngine, mcYawToGc, gcYawToMc } = require('./state');
+const { StateTranslator, windowSlotToEngine, engineSlotToWindow,
+        INV_CURSOR, mcYawToGc, gcYawToMc } = require('./state');
 const { NetPlayer, ACTION, DIG } = require('./netplayer');
 
 /** EntityPlayerSP.onUpdateWalkingPlayer's "send one anyway" interval, kept in
@@ -292,6 +293,21 @@ section('conventions');
     const engine = new Set();
     for (let s = 5; s <= 44; s++) engine.add(windowSlotToEngine(s));
     eq(engine.size, 40, 'the 40 console slots are covered exactly once');
+
+    // The inverse is what an inventory click travels through, and the failure
+    // it has to be held against is not a crash -- it is moving the wrong item
+    // and the server agreeing. So: every window slot, there and back.
+    let roundTrip = 0;
+    for (let s = 5; s <= 44; s++) {
+        const e = windowSlotToEngine(s);
+        if (e < 0) continue;
+        eq(engineSlotToWindow(e), s, `window slot ${s} survives the round trip`);
+        roundTrip++;
+    }
+    eq(roundTrip, 40, 'all 40 of them');
+    eq(engineSlotToWindow(40), -1, 'the cursor is not a window slot');
+    eq(engineSlotToWindow(-1), -1, 'nor is anything below zero');
+    eq(INV_CURSOR, 40, 'the cursor index matches GCLINK_INV_CURSOR');
 }
 
 // ---------------------------------------------------------------------------
@@ -888,6 +904,22 @@ section('player state translation');
         eq(one.readUInt8(0), 8, 'window 44 -> hotbar 8');
         s.onSetSlot({ windowId: 1, slot: 0, item: null });
         eq(of(S.INV_SET).length, 2, 'other windows are ignored');
+
+        // -- the cursor stack. Window -1 slot -1, and the only thing that can
+        //    undo a mispredicted click on the console.
+        s.onSetSlot({ windowId: -1, slot: -1,
+                      item: { blockId: 1, itemCount: 12, itemDamage: 0 } });
+        const cur = of(S.INV_SET).pop()[1];
+        eq(cur.length, 6, 'the cursor is one record');
+        eq(cur.readUInt8(0), INV_CURSOR, 'at the cursor index, past the 40 slots');
+        eq(cur.readUInt16BE(1), bm.toGlobal(1 << 4), 'carrying the stack');
+        eq(cur.readUInt8(3), 12, 'and its count');
+
+        s.onSetSlot({ windowId: -1, slot: -1, item: { blockId: -1 } });
+        const empty = of(S.INV_SET).pop()[1];
+        eq(empty.readUInt8(0), INV_CURSOR, 'putting it down states the cursor too');
+        eq(empty.readUInt16BE(1), AIR, 'as empty');
+        eq(empty.readUInt8(3), 0, 'count 0');
     }
 
     // -- chat vs the action bar, and the game-state signal.
@@ -934,6 +966,22 @@ section('outbound protocol conformance (T22)');
     const { C, S, ENT } = gclink;
     const map = mapdb.get('hontori');
 
+    /**
+     * Every packet this section produces also gets serialized for real.
+     *
+     * A fake client that only records `(name, params)` checks that the call
+     * site picked the right packet and filled in the right fields -- and says
+     * nothing at all about whether those fields can be *written*. That gap let
+     * `face: 255` live in three call sites: minecraft-data types C07's face
+     * `i8`, node's writeInt8 throws rather than truncates above 127, and the
+     * throw escaped the console dispatch and killed the proxy every time
+     * someone released a bow, finished a golden apple or dropped an item.
+     * Running the real serializer over every write closes the category, not
+     * just the three cases.
+     */
+    const serializer = require('minecraft-protocol')
+        .createSerializer({ state: 'play', isServer: false, version: '1.8.9' });
+
     /** A NetPlayer wired to fakes, plus the two lists everything is asserted
      *  against: what went to the server, and what went back to the console. */
     const make = () => {
@@ -944,13 +992,22 @@ section('outbound protocol conformance (T22)');
             selfEid: 7, teleportEpoch: 0, x: 0, y: 0, z: 0, yaw: 0, pitch: 0,
             heldSlot: 0,
             heldItem: () => ({ blockId: 276, itemCount: 1, itemDamage: 0 }),
+            // What the real one returns for a slot the server has never
+            // mentioned: "nothing", spelled the way the 1.8 slot format does.
+            slotAt: (e) => (e === 0 ? { blockId: 276, itemCount: 1, itemDamage: 0 }
+                                    : { blockId: -1 }),
             say() {}, sendAllSlots() {}, sendHealth() {}, sendGameMode() {},
         };
         const entities = { typeOf: (eid) => ({ 100: ENT.PLAYER, 101: ENT.ARROW,
                                                102: ENT.ITEM, 103: ENT.DRAGON })[eid] };
         const p = new NetPlayer({ link, state, entities,
                                   log: { info() {}, warn() {}, error() {} } });
-        p.attach({ write: (name, pkt) => written.push([name, pkt]) });
+        p.attach({ write: (name, pkt) => {
+            // Throws if the params cannot go on a real 1.8.9 wire. Let it: an
+            // exception naming the packet is a better failure than a count.
+            serializer.createPacketBuffer({ name, params: pkt });
+            written.push([name, pkt]);
+        } });
         p.setMap(map);
         return { p, state, written, sent,
                  of: (name) => written.filter((w) => w[0] === name),
@@ -1122,6 +1179,14 @@ section('outbound protocol conformance (T22)');
         eq(of('block_dig').pop()[1].status, DIG.RELEASE_USE_ITEM, 'release is C07 status 5');
         eq(to(S.USE_STATE).pop()[1].readUInt8(0), 0, 'and clears the slowdown');
 
+        // Vanilla's "no face" is 255 and the field is i8, so the value here has
+        // to be -1 and the *byte* has to be 0xFF. Asserting the byte rather
+        // than the field is the point: -1 and 255 are the same wire and only
+        // one of them can be written.
+        const rel = serializer.createPacketBuffer({
+            name: 'block_dig', params: of('block_dig').pop()[1] });
+        eq(rel[rel.length - 1], 0xff, 'C07 release carries face 0xFF, as vanilla does');
+
         // A splash potion is thrown, not drunk: the splash bit is what tells
         // the two apart, and getting it wrong slows the player for 32 ticks
         // they were never using anything.
@@ -1147,6 +1212,29 @@ section('outbound protocol conformance (T22)');
 
         p.onMessage(C.ACTION, Buffer.from([0]));
         eq(of('block_dig').pop()[1].status, DIG.DROP_ONE, 'drop item is C07 status 4');
+        const drop = serializer.createPacketBuffer({
+            name: 'block_dig', params: of('block_dig').pop()[1] });
+        eq(drop[drop.length - 1], 0xff, 'and face 0xFF with it');
+
+        // -- C0E, the inventory click. The slot numbering is the whole risk
+        //    here: engine 0 is the first hotbar slot and the window calls that
+        //    36, so a straight forward would move a real item somewhere else.
+        p.onMessage(C.WINDOW_CLICK, Buffer.from([0, 0]));
+        const c1 = of('window_click').pop()[1];
+        eq(c1.slot, 36, 'engine hotbar slot 0 is window slot 36');
+        eq(c1.windowId, 0, 'the player window');
+        eq(c1.mouseButton, 0, 'left button');
+        eq(c1.mode, 0, 'a plain click');
+        eq(c1.item.blockId, 276, 'and it claims the stack the *proxy* mirrors');
+
+        p.onMessage(C.WINDOW_CLICK, Buffer.from([9, 1]));
+        const c2 = of('window_click').pop()[1];
+        eq(c2.slot, 9, 'engine storage slots pass through unchanged');
+        eq(c2.mouseButton, 1, 'right button');
+        eq(c2.action !== c1.action, true, 'every click gets its own action number');
+
+        p.onMessage(C.WINDOW_CLICK, Buffer.from([99, 0]));
+        eq(of('window_click').length, 2, 'a slot with no window counterpart is dropped');
 
         p.onTransaction({ windowId: 0, action: 42 });
         const t = of('transaction')[0][1];

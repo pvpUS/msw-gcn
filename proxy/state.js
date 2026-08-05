@@ -39,6 +39,26 @@ function windowSlotToEngine(slot) {
     }
 }
 
+/** The inverse, for the C0E the console's inventory clicks become. A click has
+ *  to name the slot in the server's numbering, and getting this backwards would
+ *  move a real item somewhere neither end expected. Round-tripped in
+ *  selftest.js against every slot windowSlotToEngine accepts. */
+function engineSlotToWindow(e) {
+    if (e >= 0 && e <= 8) return e + 36;                 // hotbar
+    if (e >= 9 && e <= 35) return e;                     // storage
+    switch (e) {
+        case 39: return 5;   // helmet
+        case 38: return 6;   // chestplate
+        case 37: return 7;   // leggings
+        case 36: return 8;   // boots
+        default: return -1;
+    }
+}
+
+/** GC_S_INV_SET's slot index for the stack on the cursor -- one past the 40
+ *  real ones. Mirrors GCLINK_INV_CURSOR in source/gclink.h. */
+const INV_CURSOR = 40;
+
 /** Spigot's chat spam kick is generous, but the plugin's own commands go
  *  through this queue too, so keep well clear of it. */
 const CHAT_MIN_INTERVAL_MS = 1100;
@@ -67,6 +87,9 @@ class StateTranslator extends EventEmitter {
         this.yaw = 0; this.pitch = 0;
 
         this.slots = new Array(40).fill(null);
+        // The stack on the cursor. The server owns it exactly as it owns the
+        // slots, and it arrives the same way -- S2F with windowId -1.
+        this.cursor = null;
         // Which hotbar slot the server believes is held. C08 BlockPlacement
         // carries the held stack and the server validates it, so this has to
         // track S09 *and* the console's own C09 -- see netplayer.onHeldSlot.
@@ -210,8 +233,23 @@ class StateTranslator extends EventEmitter {
 
     // ---- inventory ----------------------------------------------------------
 
-    /** S2F set_slot. Window -1 slot -1 is the cursor stack; ignore. */
+    /**
+     * S2F set_slot.
+     *
+     * Window -1 slot -1 is the stack on the cursor. That used to be dropped,
+     * which was fine while the console could not click: nothing could put an
+     * item on the cursor, so nothing needed to take it off. Now that a click
+     * goes out as C0E and is predicted locally, this is the only packet that
+     * can put the prediction right -- without it, a click the server resolved
+     * differently leaves a stack stuck to the cursor with nothing able to
+     * clear it.
+     */
     onSetSlot(pkt) {
+        if (pkt.windowId === -1 && pkt.slot === -1) {
+            this.cursor = pkt.item;
+            this.sendCursor();
+            return;
+        }
         if (pkt.windowId !== 0) return;
         const e = windowSlotToEngine(pkt.slot);
         if (e < 0) return;
@@ -234,14 +272,26 @@ class StateTranslator extends EventEmitter {
 
     sendAllSlots() {
         this.sendSlots(this.slots.map((_, i) => i));
+        this.sendCursor();
+    }
+
+    /** The carried stack, as INV_SET's one out-of-range slot index. */
+    sendCursor() {
+        this.link.send(S.INV_SET, this.slotRecords([INV_CURSOR]).done());
     }
 
     sendSlots(indices) {
         if (!indices.length) return;
+        this.link.send(S.INV_SET, this.slotRecords(indices).done());
+    }
+
+    /** { u8 slot, u16 itemId, u8 count, u16 meta } per index, in engine ids.
+     *  INV_CURSOR reads from `cursor` rather than the slot array -- it is the
+     *  stack between slots, not one of them. */
+    slotRecords(indices) {
         const w = new Writer(indices.length * 6);
-        let n = 0;
         for (const e of indices) {
-            const item = this.slots[e];
+            const item = e === INV_CURSOR ? this.cursor : this.slots[e];
             const empty = !item || item.blockId === undefined || item.blockId < 0
                        || !item.itemCount;
             if (empty) {
@@ -253,9 +303,8 @@ class StateTranslator extends EventEmitter {
                  .u8(Math.min(item.itemCount, 255))
                  .u16(item.itemDamage || 0);
             }
-            n++;
         }
-        if (n) this.link.send(S.INV_SET, w.done());
+        return w;
     }
 
     /** S09 held_item_slot -- absolute, which is why the console needs an
@@ -269,7 +318,12 @@ class StateTranslator extends EventEmitter {
      *  to go straight back out in a C08. An empty hand is blockId -1, which is
      *  how the 1.8 slot format spells "nothing". */
     heldItem() {
-        const it = this.slots[this.heldSlot];
+        return this.slotAt(this.heldSlot);
+    }
+
+    /** The same, for any engine slot -- what C0E has to claim was there. */
+    slotAt(engine) {
+        const it = this.slots[engine];
         if (!it || it.blockId === undefined || it.blockId < 0 || !it.itemCount) {
             return { blockId: -1 };
         }
@@ -393,4 +447,5 @@ function gcYawToMc(yaw) {
     return m;
 }
 
-module.exports = { StateTranslator, windowSlotToEngine, mcYawToGc, gcYawToMc };
+module.exports = { StateTranslator, windowSlotToEngine, engineSlotToWindow,
+                   INV_CURSOR, mcYawToGc, gcYawToMc };

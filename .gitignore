@@ -1,6 +1,10 @@
 build/
+build_wii/
+# staged Homebrew Channel app folder, assembled by `make dist` from msw-wii.dol
+dist/
 *.elf
 *.dol
+*.iso
 *.map
 *.z64
 *.v64

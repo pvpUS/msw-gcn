@@ -30,8 +30,8 @@
  * vanilla's.
  */
 
-const { C, S, Writer } = require('./gclink');
-const { gcYawToMc } = require('./state');
+const { C, S, Writer, clamp } = require('./gclink');
+const { gcYawToMc, engineSlotToWindow } = require('./state');
 
 /** C0BPacketEntityAction.Action, in its wire order. */
 const ACTION = {
@@ -55,6 +55,23 @@ const DIG = {
 
 /** C02PacketUseEntity.Action. */
 const USE_ENTITY = { INTERACT: 0, ATTACK: 1 };
+
+/**
+ * "No face", for the C07 statuses that carry no block and for a C08 aimed at
+ * nothing. Vanilla writes 255 here; the byte on the wire is 0xFF either way.
+ *
+ * It has to be spelled -1 rather than 255 because minecraft-data types both
+ * fields `i8`, and node's Buffer.writeInt8 *throws* on 255 -- it does not
+ * truncate. That throw used to escape the console dispatch and take the whole
+ * proxy process down with it, which from the console looks like the server
+ * dropping you the instant you release a bow, finish a golden apple or drop an
+ * item. Same byte, no exception.
+ */
+const NO_FACE = -1;
+
+/** C08's cursor for a use-on-nothing. Vanilla passes 0.0F for all three and
+ *  writes `(int)(facing * 16.0F)`, so these are zero, not -1. */
+const NO_CURSOR = 0;
 
 /** EntityPlayerSP.onUpdateWalkingPlayer's thresholds, verbatim: 9.0E-4 is
  *  0.03 blocks squared, and twenty ticks is how long a perfectly still player
@@ -96,8 +113,11 @@ class NetPlayer {
         this.haveLast = false;
 
         this.usingItem = false;
+        // C0E's action number: unique per click, echoed back in S32. Starts at
+        // 0 and stays inside a signed short, which is what the field is.
+        this.clickAction = 0;
         this.stats = { moves: 0, stale: 0, digs: 0, places: 0, attacks: 0,
-                       rejected: 0, swings: 0 };
+                       rejected: 0, swings: 0, clicks: 0 };
     }
 
     attach(client) {
@@ -126,7 +146,7 @@ class NetPlayer {
             if (this.usingItem) {
                 this.client.write('block_dig', {
                     status: DIG.RELEASE_USE_ITEM,
-                    location: { x: 0, y: 0, z: 0 }, face: 255,
+                    location: { x: 0, y: 0, z: 0 }, face: NO_FACE,
                 });
             }
         }
@@ -160,6 +180,7 @@ class NetPlayer {
             case C.HELD_SLOT:  return this.onHeldSlot(payload);
             case C.CHAT:       return this.state.say(payload.toString('ascii'));
             case C.ACTION:     return this.onAction(payload);
+            case C.WINDOW_CLICK: return this.onWindowClick(payload);
             default:           return false;
         }
     }
@@ -275,7 +296,12 @@ class NetPlayer {
 
     // ---- blocks ------------------------------------------------------------
 
-    /** u8 status, s16 x, y, z, u8 face. [8 B] */
+    /** u8 status, s16 x, y, z, u8 face. [8 B]
+     *
+     *  The face is clamped to the six that exist rather than forwarded. Both
+     *  ends read it out of a u8 and minecraft-data writes it as an i8, so
+     *  anything above 127 is not a wrong face -- it is a throw, and the two
+     *  should not be the same failure. */
     onDig(buf) {
         if (buf.length < 8 || !this.client || !this.map) return;
         const status = buf.readUInt8(0);
@@ -287,7 +313,7 @@ class NetPlayer {
                 y: buf.readInt16BE(3) + this.map.originY,
                 z: buf.readInt16BE(5) + this.map.originZ,
             },
-            face: buf.readUInt8(7),
+            face: clamp(buf.readUInt8(7), 0, 5),
         });
         this.stats.digs++;
     }
@@ -305,11 +331,14 @@ class NetPlayer {
                 y: buf.readInt16BE(2) + this.map.originY,
                 z: buf.readInt16BE(4) + this.map.originZ,
             },
-            direction: buf.readUInt8(6),
+            direction: clamp(buf.readUInt8(6), 0, 5),
             heldItem: this.state.heldItem(),
-            cursorX: buf.readUInt8(7),
-            cursorY: buf.readUInt8(8),
-            cursorZ: buf.readUInt8(9),
+            // Sixteenths of a block, and the console already clamps them --
+            // but these are i8 on the wire, so an out-of-range one would throw
+            // rather than land in the wrong corner of the block.
+            cursorX: clamp(buf.readUInt8(7), 0, 15),
+            cursorY: clamp(buf.readUInt8(8), 0, 15),
+            cursorZ: clamp(buf.readUInt8(9), 0, 15),
         });
         this.stats.places++;
     }
@@ -327,7 +356,7 @@ class NetPlayer {
             this.client.write('block_dig', {
                 status: DIG.RELEASE_USE_ITEM,
                 location: { x: 0, y: 0, z: 0 },
-                face: 255,
+                face: NO_FACE,
             });
             this.setUsing(false);
             return;
@@ -335,12 +364,12 @@ class NetPlayer {
 
         // "Use the held item on nothing", which is what a bow draw, a bite of
         // a golden apple and a thrown pearl all are: C08 at (-1,-1,-1) with
-        // face 255.
+        // face 255 and a zero cursor.
         this.client.write('block_place', {
             location: { x: -1, y: -1, z: -1 },
-            direction: -1,
+            direction: NO_FACE,
             heldItem: this.state.heldItem(),
-            cursorX: -1, cursorY: -1, cursorZ: -1,
+            cursorX: NO_CURSOR, cursorY: NO_CURSOR, cursorZ: NO_CURSOR,
         });
         this.setUsing(this.heldItemIsHeldDown());
     }
@@ -387,13 +416,54 @@ class NetPlayer {
             this.client.write('block_dig', {
                 status: a === 1 ? DIG.DROP_ALL : DIG.DROP_ONE,
                 location: { x: 0, y: 0, z: 0 },
-                face: 255,
+                face: NO_FACE,
             });
         } else if (a === 3) {
             this.state.sendAllSlots();
             this.state.sendHealth();
             this.state.sendGameMode();
         }
+    }
+
+    // ---- the inventory window ------------------------------------------------
+
+    /**
+     * u8 engine slot, u8 button. [2 B] -> C0E ClickWindow.
+     *
+     * Three of C0E's six fields are the proxy's rather than the console's, and
+     * each for its own reason:
+     *
+     *   slot        the console counts slots the engine's way (hotbar first);
+     *               the server counts them the window's way (hotbar last, at
+     *               36-44). engineSlotToWindow is the only place that converts.
+     *   item        the stack the client believed was there. The server checks
+     *               it, and the proxy's mirror is what the server itself last
+     *               said -- so it agrees by construction where the console's
+     *               copy only agrees between updates.
+     *   action      a per-window counter the server echoes in S32. It has to be
+     *               unique and it has to come from whoever is sending, which is
+     *               here.
+     *
+     * A rejected click is not an error to handle: the server answers with S2F
+     * or S30 and the window snaps back, which is exactly what the console's
+     * local prediction needs to hear.
+     */
+    onWindowClick(buf) {
+        if (buf.length < 2 || !this.client) return;
+        const engine = buf.readUInt8(0);
+        const slot = engineSlotToWindow(engine);
+        if (slot < 0) { this.stats.rejected++; return; }
+
+        this.clickAction = (this.clickAction + 1) & 0x7fff;
+        this.client.write('window_click', {
+            windowId: 0,
+            slot,
+            mouseButton: buf.readUInt8(1) === 1 ? 1 : 0,
+            action: this.clickAction,
+            mode: 0,                       // a plain click; no shift, no drag
+            item: this.state.slotAt(engine),
+        });
+        this.stats.clicks++;
     }
 
     // ---- combat ------------------------------------------------------------
@@ -440,7 +510,7 @@ class NetPlayer {
         const s = this.stats;
         return `player ${s.moves} moves (${s.stale} stale), ${s.digs} digs, ` +
                `${s.places} places, ${s.swings} swings, ${s.attacks} attacks ` +
-               `(${s.rejected} filtered)`;
+               `(${s.rejected} filtered), ${s.clicks} window clicks`;
     }
 }
 
